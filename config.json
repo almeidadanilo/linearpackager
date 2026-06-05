@@ -1,0 +1,78 @@
+{
+  "channel": {
+    "id": "ch1",
+    "name": "Channel One"
+  },
+  "input": {
+    "type": "file",
+    "file": {
+      "path": "D:/Video/Content/BWF_TopSavesOfTheWeek.mp4",
+      "loop": true,
+      "live_simulation": true
+    },
+    "srt": {
+      "host": "0.0.0.0",
+      "port": 1234,
+      "mode": "listener",
+      "latency_ms": 200,
+      "passphrase": ""
+    }
+  },
+  "transcoder": {
+    "video_codec": "libx264",
+    "audio_codec": "aac",
+    "preset": "veryfast",
+    "keyframe_interval": 2,
+    "ladder": [
+      {
+        "name": "1080p",
+        "width": 1920,
+        "height": 1080,
+        "video_bitrate": "4000k",
+        "audio_bitrate": "192k",
+        "framerate": 30
+      },
+      {
+        "name": "720p",
+        "width": 1280,
+        "height": 720,
+        "video_bitrate": "2000k",
+        "audio_bitrate": "128k",
+        "framerate": 30
+      },
+      {
+        "name": "360p",
+        "width": 640,
+        "height": 360,
+        "video_bitrate": "800k",
+        "audio_bitrate": "96k",
+        "framerate": 25
+      }
+    ]
+  },
+  "packaging": {
+    "segment_duration": 6,
+    "work_dir": "./output/segments",
+    "segment_retention": 7,
+    "hls": {
+      "enabled": true,
+      "playlist_window": 5,
+      "output_dir": "./output/hls"
+    },
+    "dash": {
+      "enabled": true,
+      "window_size": 5,
+      "output_dir": "./output/dash"
+    }
+  },
+  "esam": {
+    "enabled": true,
+    "listen_port": 9090,
+    "path": "/esam/notify",
+    "acquisition_point_identity": "ch1-origin"
+  },
+  "server": {
+    "http_port": 8080,
+    "base_url": "http://localhost:8080"
+  }
+}

@@ -1,0 +1,39 @@
+# ── Binaries ──────────────────────────────────────────────────────────────────
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+linear-packager
+
+# ── Test & coverage ───────────────────────────────────────────────────────────
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# ── Go build cache / module download cache ────────────────────────────────────
+vendor/
+
+# ── Runtime output ────────────────────────────────────────────────────────────
+# Generated at runtime — never commit transcoded media or playlists
+output/
+run_output.txt
+run_error.txt
+run_fresh.txt
+run_fresh_err.txt
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key

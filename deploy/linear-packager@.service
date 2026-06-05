@@ -1,0 +1,40 @@
+[Unit]
+Description=Linear Packager — channel %i
+Documentation=https://github.com/synamedia/linear-packager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=packager
+Group=packager
+
+# Each channel lives in its own subdirectory named after the instance (%i).
+# Example: systemctl start linear-packager@ch1
+#          → WorkingDirectory = /opt/linear-packager/channels/ch1
+WorkingDirectory=/opt/linear-packager/channels/%i
+ExecStart=/usr/local/bin/linear-packager -config config.json
+
+# Restart on any failure; give it 5 s before trying again.
+Restart=on-failure
+RestartSec=5s
+
+# Give FFmpeg up to 30 s to flush and exit cleanly on SIGTERM.
+TimeoutStopSec=30s
+
+# Send SIGTERM to the main process only; let the Go app propagate to children.
+KillMode=process
+
+# Logging goes to journald; use  journalctl -u linear-packager@ch1 -f  to tail.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=linear-packager-%i
+
+# Hardening (comment out if they cause issues on older kernels)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/linear-packager/channels/%i
+
+[Install]
+WantedBy=multi-user.target
