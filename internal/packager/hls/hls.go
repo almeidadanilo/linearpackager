@@ -48,14 +48,20 @@ type rungState struct {
 
 // ── packager ─────────────────────────────────────────────────────────────────
 
+// minStartSegments is the number of segments each rung must accumulate before
+// the master playlist is written. This ensures players always start with a
+// healthy live buffer and never hit the live edge cold.
+const minStartSegments = 3
+
 // Packager maintains per-rung sliding-window HLS media playlists and a static
 // master playlist.  It also injects SCTE-35 CUE-OUT/IN markers when a splice
 // event is received from the ESAM queue.
 type Packager struct {
-	cfg     *config.Config
-	outDir  string
-	rungs   map[string]*rungState
-	relDirs map[string]string // rung → relative URL prefix from playlist dir to segments dir
+	cfg           *config.Config
+	outDir        string
+	rungs         map[string]*rungState
+	relDirs       map[string]string // rung → relative URL prefix from playlist dir to segments dir
+	masterWritten bool
 
 	spliceIn    <-chan splice.Event
 	pendingEvt  *splice.Event
@@ -95,9 +101,6 @@ func (p *Packager) SetSpliceQueue(q *splice.Queue) {
 // begins consuming segments in a background goroutine.
 func (p *Packager) Start(ctx context.Context, segs <-chan segment.Segment) error {
 	if err := p.prepareOutputDirs(); err != nil {
-		return err
-	}
-	if err := p.writeMasterPlaylist(); err != nil {
 		return err
 	}
 	go p.run(ctx, segs)
@@ -200,7 +203,26 @@ func (p *Packager) handleSegment(seg segment.Segment) error {
 		return err
 	}
 	slog.Debug("hls: playlist updated", "rung", seg.Rung, "seq", e.index)
+
+	if !p.masterWritten && p.allRungsReady() {
+		if err := p.writeMasterPlaylist(); err != nil {
+			return err
+		}
+		p.masterWritten = true
+		slog.Info("hls: master playlist published", "min_segments", minStartSegments)
+	}
 	return nil
+}
+
+// allRungsReady returns true once every rung has accumulated at least
+// minStartSegments entries in its sliding window.
+func (p *Packager) allRungsReady() bool {
+	for _, rs := range p.rungs {
+		if len(rs.entries) < minStartSegments {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Packager) writeMediaPlaylist(rung string, state *rungState) error {
@@ -249,8 +271,8 @@ func (p *Packager) writeMasterPlaylist() error {
 	for _, r := range p.cfg.Transcoder.Ladder {
 		bw := (util.ParseBitrateKbps(r.VideoBitrate) + util.ParseBitrateKbps(r.AudioBitrate)) * 1000
 		fmt.Fprintln(&b)
-		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"avc1.64001f,mp4a.40.2\"\n",
-			bw, r.Width, r.Height)
+		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s\"\n",
+			bw, r.Width, r.Height, util.AVC1Codec(r.Width, r.Height, r.Framerate))
 		fmt.Fprintf(&b, "%s/media.m3u8\n", r.Name)
 	}
 

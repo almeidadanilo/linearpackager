@@ -21,17 +21,9 @@
   "transcoder": {
     "video_codec": "libx264",
     "audio_codec": "aac",
-    "preset": "veryfast",
+    "preset": "ultrafast",
     "keyframe_interval": 2,
     "ladder": [
-      {
-        "name": "1080p",
-        "width": 1920,
-        "height": 1080,
-        "video_bitrate": "4000k",
-        "audio_bitrate": "192k",
-        "framerate": 30
-      },
       {
         "name": "720p",
         "width": 1280,
@@ -52,27 +44,27 @@
   },
   "packaging": {
     "segment_duration": 6,
-    "work_dir": "./output/segments",
+    "work_dir": "./output/ch1/segments",
     "segment_retention": 7,
     "hls": {
       "enabled": true,
       "playlist_window": 5,
-      "output_dir": "./output/hls"
+      "output_dir": "./output/ch1/hls"
     },
     "dash": {
       "enabled": true,
       "window_size": 5,
-      "output_dir": "./output/dash"
+      "output_dir": "./output/ch1/dash"
     }
   },
   "esam": {
     "enabled": true,
     "listen_port": 9090,
     "path": "/esam/notify",
-    "acquisition_point_identity": "ch1-origin"
+    "acquisition_point_identity": "ap_ch1"
   },
   "server": {
-    "http_port": 8080,
-    "base_url": "http://localhost:8080"
+    "http_port": 9090,
+    "base_url": "http://localhost:9090"
   }
 }

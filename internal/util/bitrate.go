@@ -24,6 +24,25 @@ func ParseBitrateKbps(s string) int64 {
 	}
 }
 
+// AVC1Codec returns the RFC 6381 codec string for H.264 High Profile at the
+// level appropriate for the given resolution and frame rate.
+func AVC1Codec(width, height, fps int) string {
+	var level int
+	switch {
+	case width > 1280 || height > 720:
+		if fps > 30 {
+			level = 0x2a // 4.2
+		} else {
+			level = 0x28 // 4.0
+		}
+	case width > 720 || height > 576:
+		level = 0x1f // 3.1
+	default:
+		level = 0x1e // 3.0
+	}
+	return fmt.Sprintf("avc1.6400%02x,mp4a.40.2", level)
+}
+
 // WriteFileAtomic writes data to path, creating the parent directory if
 // needed.  On Windows, os.Rename over an open file fails with "Access is
 // denied", so we write directly.  The DASH packager serialises calls with

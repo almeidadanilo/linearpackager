@@ -1,9 +1,12 @@
 package dash
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,13 +44,14 @@ type rungState struct {
 // sliding window per rung, and rewrites the DASH MPD after every new segment.
 // SCTE-35 events are injected as EventStream elements inside the Period.
 type Packager struct {
-	cfg       *config.Config
-	outDir    string
-	rungs     map[string]*rungState
-	mu        sync.Mutex // protects rungs + startTime + spliceEvents
-	mpdMu     sync.Mutex // serialises manifest.mpd writes (Windows rename contention)
-	startTime time.Time
-	sem       chan struct{}
+	cfg          *config.Config
+	outDir       string
+	rungs        map[string]*rungState
+	codecStrings map[string]string // rung → actual RFC 6381 codec string from avcC box
+	mu           sync.Mutex        // protects rungs + startTime + spliceEvents + codecStrings
+	mpdMu        sync.Mutex        // serialises manifest.mpd writes (Windows rename contention)
+	startTime    time.Time
+	sem          chan struct{}
 
 	spliceIn     <-chan splice.Event
 	spliceEvents []spliceRecord // retained splice events to include in MPD
@@ -59,10 +63,11 @@ func New(cfg *config.Config) *Packager {
 		rungs[r.Name] = &rungState{window: cfg.Packaging.DASH.WindowSize}
 	}
 	return &Packager{
-		cfg:    cfg,
-		outDir: cfg.Packaging.DASH.OutputDir,
-		rungs:  rungs,
-		sem:    make(chan struct{}, maxConcurrentRemux),
+		cfg:          cfg,
+		outDir:       cfg.Packaging.DASH.OutputDir,
+		rungs:        rungs,
+		codecStrings: make(map[string]string),
+		sem:          make(chan struct{}, maxConcurrentRemux),
 	}
 }
 
@@ -149,7 +154,48 @@ func (p *Packager) handleSegment(ctx context.Context, seg segment.Segment) {
 		return
 	}
 
+	fmp4Data, err := os.ReadFile(mp4Path)
+	if err != nil {
+		slog.Error("dash: read fmp4 failed", "rung", seg.Rung, "error", err)
+		return
+	}
+	initBytes, mediaBytes, err := splitFMP4(fmp4Data)
+	if err != nil {
+		slog.Error("dash: fMP4 split failed", "rung", seg.Rung, "error", err)
+		return
+	}
+
+	// FFmpeg normalises remuxed timestamps to start at 0 for every segment.
+	// DASH players use the MPD timeline to seek, so each fragment's
+	// baseMediaDecodeTime must reflect its absolute position in the stream.
+	// Use the actual PTS start time from the segment CSV (seg.StartTime) rather
+	// than segIdx×segDur so the offset is exact even when segment durations
+	// are not perfectly uniform or the packager attached mid-stream.
+	if ts := parseTrackTimescales(initBytes); len(ts) > 0 {
+		patchTFDT(mediaBytes, seg.StartTime, ts)
+	}
+
+	if err := os.WriteFile(mp4Path, mediaBytes, 0o644); err != nil {
+		slog.Error("dash: write media segment failed", "rung", seg.Rung, "error", err)
+		return
+	}
+
+	// Write init.mp4 once per rung and extract the actual codec string from avcC.
+	var detectedCodec string
+	initPath := filepath.Join(p.outDir, seg.Rung, "init.mp4")
+	if _, statErr := os.Stat(initPath); os.IsNotExist(statErr) && len(initBytes) > 0 {
+		if err := util.WriteFileAtomic(initPath, initBytes); err != nil {
+			slog.Error("dash: write init segment failed", "rung", seg.Rung, "error", err)
+			return
+		}
+		detectedCodec = parseAVC1Codec(initBytes)
+		slog.Info("dash: init segment written", "rung", seg.Rung, "codec", detectedCodec)
+	}
+
 	p.mu.Lock()
+	if detectedCodec != "" {
+		p.codecStrings[seg.Rung] = detectedCodec
+	}
 	if p.startTime.IsZero() {
 		p.startTime = time.Now().Add(-time.Duration(float64(time.Second) * seg.StartTime))
 	}
@@ -171,18 +217,66 @@ func (p *Packager) handleSegment(ctx context.Context, seg segment.Segment) {
 	slog.Debug("dash: segment ready", "rung", seg.Rung, "file", mp4Name)
 }
 
+// splitFMP4 parses an in-memory self-contained fMP4 and returns:
+//   - initBytes: ftyp + moov boxes only (MSE init segment)
+//   - mediaBytes: moof + mdat boxes only (MSE media segment)
+//
+// All other box types (free, skip, mfra, sidx, …) are discarded.
+// FFmpeg sometimes writes a "free" padding box between moov and the first
+// moof; including it in the media segment would make the file start with
+// "free" instead of "moof", causing both FFprobe and browser MSE to reject it.
+func splitFMP4(data []byte) (initBytes, mediaBytes []byte, err error) {
+	for off := 0; off+8 <= len(data); {
+		size := int(binary.BigEndian.Uint32(data[off : off+4]))
+		if size < 8 || off+size > len(data) {
+			break
+		}
+		boxType := string(data[off+4 : off+8])
+		switch boxType {
+		case "ftyp", "moov":
+			initBytes = append(initBytes, data[off:off+size]...)
+		case "moof", "mdat":
+			mediaBytes = append(mediaBytes, data[off:off+size]...)
+		// free, skip, mfra, sidx, etc. — discard
+		}
+		off += size
+	}
+	if len(mediaBytes) == 0 {
+		return nil, nil, fmt.Errorf("no moof/mdat boxes found in fMP4")
+	}
+	return initBytes, mediaBytes, nil
+}
+
+// parseAVC1Codec scans raw fMP4 bytes for an avcC box and returns the RFC 6381
+// codec string "avc1.PPCCLL,mp4a.40.2" built from the actual SPS profile bytes.
+// Returns "" when the avcC box cannot be found or is malformed.
+func parseAVC1Codec(data []byte) string {
+	idx := bytes.Index(data, []byte("avcC"))
+	// idx is the offset of the box type field; size field is 4 bytes before it,
+	// and the avcC payload starts 4 bytes after (version + profile + constraints + level).
+	if idx < 4 || idx+8 > len(data) {
+		return ""
+	}
+	if data[idx+4] != 1 { // configurationVersion must be 1
+		return ""
+	}
+	return fmt.Sprintf("avc1.%02x%02x%02x,mp4a.40.2", data[idx+5], data[idx+6], data[idx+7])
+}
+
 // remuxToFMP4 converts an MPEG-TS segment to a self-contained fragmented MP4.
-// Each output file carries its own moov box so no separate init segment is
-// required (compatible with SegmentList-based DASH).
 func remuxToFMP4(tsPath, mp4Path string) error {
 	// AAC in MPEG-TS uses ADTS framing; MP4 requires ADIF (raw) framing.
 	// The aac_adtstoasc BSF strips the ADTS headers during remux.
+	// delay_moov defers the moov box until after the first fragment has been
+	// processed.  This ensures aac_adtstoasc has seen an audio packet and can
+	// write a complete AudioSpecificConfig into the esds box, and it produces
+	// proper moof+mdat ordering (no standalone mdat before the first moof).
 	cmd := exec.Command("ffmpeg", "-y", "-loglevel", "error",
 		"-i", tsPath,
 		"-c", "copy",
 		"-bsf:a", "aac_adtstoasc",
 		"-f", "mp4",
-		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-movflags", "frag_keyframe+delay_moov+default_base_moof",
 		mp4Path,
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -197,11 +291,9 @@ func (p *Packager) writeMPD() error {
 
 	p.mu.Lock()
 	startTime := p.startTime
-	snapshot := make(map[string][]segEntry, len(p.rungs))
-	for name, state := range p.rungs {
-		cp := make([]segEntry, len(state.entries))
-		copy(cp, state.entries)
-		snapshot[name] = cp
+	codecSnap := make(map[string]string, len(p.codecStrings))
+	for k, v := range p.codecStrings {
+		codecSnap[k] = v
 	}
 	spliceSnap := make([]spliceRecord, len(p.spliceEvents))
 	copy(spliceSnap, p.spliceEvents)
@@ -209,6 +301,10 @@ func (p *Packager) writeMPD() error {
 
 	minUpdate := p.cfg.Packaging.SegmentDuration
 	tsDepth := p.cfg.Packaging.DASH.WindowSize * minUpdate
+	segDurMs := p.cfg.Packaging.SegmentDuration * 1000
+	// Start 3 segments behind the live edge so segments are always on disk when
+	// the player requests them.
+	presentDelay := minUpdate * 3
 
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
@@ -216,6 +312,7 @@ func (p *Packager) writeMPD() error {
 	b.WriteString(`     type="dynamic"` + "\n")
 	fmt.Fprintf(&b, `     minimumUpdatePeriod="PT%dS"`+"\n", minUpdate)
 	fmt.Fprintf(&b, `     minBufferTime="PT%dS"`+"\n", minUpdate*2)
+	fmt.Fprintf(&b, `     suggestedPresentationDelay="PT%dS"`+"\n", presentDelay)
 	fmt.Fprintf(&b, `     availabilityStartTime="%s"`+"\n", startTime.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&b, `     timeShiftBufferDepth="PT%dS">`+"\n", tsDepth)
 	b.WriteString(`  <Period start="PT0S" id="1">` + "\n")
@@ -234,23 +331,29 @@ func (p *Packager) writeMPD() error {
 		b.WriteString(`    </EventStream>` + "\n")
 	}
 
-	// ── AdaptationSet + Representations ──────────────────────────────────────
-	b.WriteString(`    <AdaptationSet id="1" contentType="video" mimeType="video/mp4"` + "\n")
-	b.WriteString(`                   codecs="avc1.64001f,mp4a.40.2"` + "\n")
+	// ── AdaptationSet + Representations (SegmentTemplate for live) ───────────
+	// SegmentTemplate lets the player compute segment N's URL as
+	// "{rung}/seg{N:05d}.mp4" using wall-clock time alone, without needing a
+	// full segment listing in every MPD update.  startNumber="0" matches our
+	// 0-based file names (seg00000.mp4, seg00001.mp4, …).
+	b.WriteString(`    <AdaptationSet id="1" mimeType="video/mp4"` + "\n")
 	b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
 
 	for _, r := range p.cfg.Transcoder.Ladder {
 		bw := (util.ParseBitrateKbps(r.VideoBitrate) + util.ParseBitrateKbps(r.AudioBitrate)) * 1000
-		entries := snapshot[r.Name]
-
-		fmt.Fprintf(&b, `      <Representation id="%s" bandwidth="%d" width="%d" height="%d">`+"\n",
-			r.Name, bw, r.Width, r.Height)
-		segDurMs := p.cfg.Packaging.SegmentDuration * 1000
-		fmt.Fprintf(&b, `        <SegmentList duration="%d" timescale="1000">`+"\n", segDurMs)
-		for _, e := range entries {
-			fmt.Fprintf(&b, `          <SegmentURL media="%s/%s"/>`+"\n", r.Name, e.filename)
+		codecs := codecSnap[r.Name]
+		if codecs == "" {
+			codecs = util.AVC1Codec(r.Width, r.Height, r.Framerate)
 		}
-		b.WriteString(`        </SegmentList>` + "\n")
+
+		fmt.Fprintf(&b, `      <Representation id="%s" bandwidth="%d" width="%d" height="%d" codecs="%s">`+"\n",
+			r.Name, bw, r.Width, r.Height, codecs)
+		// %% in the format string produces a literal % in the output, giving
+		// the DASH template identifier $Number%05d$ (5-digit zero-padded).
+		fmt.Fprintf(&b, `        <SegmentTemplate media="%s/seg$Number%%05d$.mp4"`+"\n", r.Name)
+		fmt.Fprintf(&b, `                         initialization="%s/init.mp4"`+"\n", r.Name)
+		fmt.Fprintf(&b, `                         startNumber="0"`+"\n")
+		fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
 		b.WriteString(`      </Representation>` + "\n")
 	}
 
@@ -269,4 +372,132 @@ func (p *Packager) prepareOutputDirs() error {
 		}
 	}
 	return nil
+}
+
+// scanBoxes calls fn(boxType, payload) for every top-level ISO BMFF box in
+// data.  payload is the box contents excluding the 8-byte size+type header.
+// Modifications to payload write through to the original slice.
+func scanBoxes(data []byte, fn func(boxType string, payload []byte)) {
+	for off := 0; off+8 <= len(data); {
+		size := int(binary.BigEndian.Uint32(data[off : off+4]))
+		if size < 8 || off+size > len(data) {
+			break
+		}
+		fn(string(data[off+4:off+8]), data[off+8:off+size])
+		off += size
+	}
+}
+
+// parseTrackTimescales scans the moov box in initBytes and returns a map of
+// track_ID → timescale read from tkhd and mdhd respectively.
+func parseTrackTimescales(initBytes []byte) map[uint32]uint32 {
+	result := make(map[uint32]uint32)
+	scanBoxes(initBytes, func(bt string, moovPayload []byte) {
+		if bt != "moov" {
+			return
+		}
+		scanBoxes(moovPayload, func(bt2 string, trakPayload []byte) {
+			if bt2 != "trak" {
+				return
+			}
+			var trackID, timescale uint32
+			scanBoxes(trakPayload, func(bt3 string, p []byte) {
+				switch bt3 {
+				case "tkhd":
+					// FullBox: version(1)+flags(3) then ctime+mtime+track_ID
+					// v=0: ctime(4)+mtime(4)+track_ID(4) → track_ID at p[12]
+					// v=1: ctime(8)+mtime(8)+track_ID(4) → track_ID at p[24]  ← wait
+					// Actually: v=0 payload: version(1)+flags(3)+ctime(4)+mtime(4)+track_ID(4)=p[12]
+					//           v=1 payload: version(1)+flags(3)+ctime(8)+mtime(8)+track_ID(4)=p[20]
+					if len(p) >= 16 {
+						ver := p[0]
+						if ver == 0 {
+							trackID = binary.BigEndian.Uint32(p[12:16])
+						} else if ver == 1 && len(p) >= 24 {
+							trackID = binary.BigEndian.Uint32(p[20:24])
+						}
+					}
+				case "mdia":
+					scanBoxes(p, func(bt4 string, mp []byte) {
+						if bt4 != "mdhd" {
+							return
+						}
+						// v=0: version(1)+flags(3)+ctime(4)+mtime(4)+timescale(4) → mp[12]
+						// v=1: version(1)+flags(3)+ctime(8)+mtime(8)+timescale(4) → mp[20]
+						if len(mp) >= 16 {
+							ver := mp[0]
+							if ver == 0 {
+								timescale = binary.BigEndian.Uint32(mp[12:16])
+							} else if ver == 1 && len(mp) >= 24 {
+								timescale = binary.BigEndian.Uint32(mp[20:24])
+							}
+						}
+					})
+				}
+			})
+			if trackID > 0 && timescale > 0 {
+				result[trackID] = timescale
+			}
+		})
+	})
+	return result
+}
+
+// patchTFDT adds segIdx×segDurSec×timescale to every tfdt.baseMediaDecodeTime
+// found in mediaBytes.  The patch is applied in-place.
+// This corrects FFmpeg's timestamp normalisation: remuxing TS→MP4 subtracts
+// the initial PTS so every segment starts at tfdt=0 regardless of its position
+// in the stream.  DASH players derive the seek target from the MPD timeline
+// (segIdx×segDurSec), so tfdt must match.
+func patchTFDT(mediaBytes []byte, startTimeSec float64, timescales map[uint32]uint32) {
+	scanBoxes(mediaBytes, func(bt string, moofPayload []byte) {
+		if bt != "moof" {
+			return
+		}
+		scanBoxes(moofPayload, func(bt2 string, trafPayload []byte) {
+			if bt2 != "traf" {
+				return
+			}
+			var trackID uint32
+			var offset uint64
+			scanBoxes(trafPayload, func(bt3 string, p []byte) {
+				switch bt3 {
+				case "tfhd":
+					// FullBox: version(1)+flags(3)+track_ID(4)
+					if len(p) >= 8 {
+						trackID = binary.BigEndian.Uint32(p[4:8])
+						if ts, ok := timescales[trackID]; ok && ts > 0 {
+							offset = uint64(math.Round(startTimeSec * float64(ts)))
+						}
+					}
+				case "tfdt":
+					if offset == 0 || len(p) < 4 {
+						return
+					}
+					// FullBox: version(1)+flags(3)+baseMediaDecodeTime(4 or 8)
+					ver := p[0]
+					if ver == 1 && len(p) >= 12 {
+						bmdt := uint64(p[4])<<56 | uint64(p[5])<<48 | uint64(p[6])<<40 | uint64(p[7])<<32 |
+							uint64(p[8])<<24 | uint64(p[9])<<16 | uint64(p[10])<<8 | uint64(p[11])
+						bmdt += offset
+						p[4] = byte(bmdt >> 56)
+						p[5] = byte(bmdt >> 48)
+						p[6] = byte(bmdt >> 40)
+						p[7] = byte(bmdt >> 32)
+						p[8] = byte(bmdt >> 24)
+						p[9] = byte(bmdt >> 16)
+						p[10] = byte(bmdt >> 8)
+						p[11] = byte(bmdt)
+					} else if ver == 0 && len(p) >= 8 {
+						bmdt := uint32(p[4])<<24 | uint32(p[5])<<16 | uint32(p[6])<<8 | uint32(p[7])
+						bmdt += uint32(offset)
+						p[4] = byte(bmdt >> 24)
+						p[5] = byte(bmdt >> 16)
+						p[6] = byte(bmdt >> 8)
+						p[7] = byte(bmdt)
+					}
+				}
+			})
+		})
+	})
 }

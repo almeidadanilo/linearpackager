@@ -66,7 +66,6 @@ func buildFFmpegArgs(cfg *config.Config, src input.Source, workDir string) []str
 			"-segment_format", "mpegts",
 			"-segment_list", filepath.Join(rungDir, "segments.csv"),
 			"-segment_list_type", "csv",
-			"-reset_timestamps", "1",
 			filepath.Join(rungDir, "seg%05d.ts"),
 		)
 	}
