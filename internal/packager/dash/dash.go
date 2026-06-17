@@ -100,15 +100,16 @@ func (p *Packager) drainSplices(ctx context.Context) {
 			if !p.startTime.IsZero() {
 				elapsed = time.Since(p.startTime).Seconds()
 			}
+			// Place the splice point 5 seconds ahead (pre-roll) in the presentation timeline.
 			p.spliceEvents = append(p.spliceEvents, spliceRecord{
 				event:      e,
-				presentSec: elapsed,
+				presentSec: elapsed + 5.0,
 			})
-			// Trim old splice events that are outside the time-shift buffer.
-			maxAge := float64(p.cfg.Packaging.DASH.WindowSize * p.cfg.Packaging.SegmentDuration)
+			// Trim events whose break has fully elapsed from the presentation.
 			var keep []spliceRecord
 			for _, sr := range p.spliceEvents {
-				if elapsed-sr.presentSec <= maxAge {
+				breakEnd := sr.presentSec + sr.event.Duration.Seconds()
+				if elapsed < breakEnd {
 					keep = append(keep, sr)
 				}
 			}
@@ -304,6 +305,17 @@ func (p *Packager) writeMPD() error {
 	codecSnap := make(map[string]string, len(p.codecStrings))
 	for k, v := range p.codecStrings {
 		codecSnap[k] = v
+	}
+	// Evict splice events whose break has fully elapsed so they disappear from the MPD.
+	if !startTime.IsZero() {
+		elapsed := time.Since(startTime).Seconds()
+		var active []spliceRecord
+		for _, sr := range p.spliceEvents {
+			if elapsed < sr.presentSec+sr.event.Duration.Seconds() {
+				active = append(active, sr)
+			}
+		}
+		p.spliceEvents = active
 	}
 	spliceSnap := make([]spliceRecord, len(p.spliceEvents))
 	copy(spliceSnap, p.spliceEvents)

@@ -1,8 +1,8 @@
 // Package scte35 generates binary SCTE-35 splice_info_section structures.
 //
 // Reference: SCTE-35 2022 specification.
-// Only splice_insert() with splice_immediate_flag=1 is implemented here —
-// enough to satisfy the on-demand break signalling from ESAM.
+// splice_insert() with timed splice (splice_immediate_flag=0) is supported;
+// pass ptsTime90kHz=0 to fall back to splice_immediate_flag=1.
 package scte35
 
 import (
@@ -18,10 +18,8 @@ import (
 //   - outOfNetwork    : out_of_network_indicator (true = start of ad break)
 //   - durationSec     : break duration in seconds (0 = no duration flag)
 //   - uniqueProgramID : unique_program_id (from ESAM uniqueProgramID attribute)
-//
-// The command always uses splice_immediate_flag=1 so the splice happens at
-// the next segment boundary, avoiding the need to track PTS alignment.
-func EncodeSpliceInsert(eventID uint32, outOfNetwork bool, durationSec float64, uniqueProgramID uint16) ([]byte, error) {
+//   - ptsTime90kHz    : splice_time PTS in 90 kHz ticks; 0 = use splice_immediate_flag=1
+func EncodeSpliceInsert(eventID uint32, outOfNetwork bool, durationSec float64, uniqueProgramID uint16, ptsTime90kHz uint64) ([]byte, error) {
 	// ── splice_insert() command body ────────────────────────────────────────
 	var cmd []byte
 
@@ -35,17 +33,35 @@ func EncodeSpliceInsert(eventID uint32, outOfNetwork bool, durationSec float64, 
 	//   out_of_network_indicator  1
 	//   program_splice_flag       1  = 1 (always)
 	//   duration_flag             1  = 1 when durationSec > 0
-	//   splice_immediate_flag     1  = 1 (splice at next opportunity)
+	//   splice_immediate_flag     1  = 0 when ptsTime90kHz > 0, else 1
 	//   reserved                  4
+	immediate := ptsTime90kHz == 0
 	durFlag := byte(0)
 	if durationSec > 0 {
 		durFlag = 0x20
 	}
-	flags := byte(0x50) | durFlag // program_splice=1, immediate=1
+	immFlag := byte(0x10)
+	if !immediate {
+		immFlag = 0x00
+	}
+	flags := byte(0x40) | immFlag | durFlag // program_splice=1
 	if outOfNetwork {
 		flags |= 0x80
 	}
 	cmd = append(cmd, flags)
+
+	// splice_time() — only present when program_splice=1 and immediate=0: 40 bits
+	//   time_specified_flag(1)=1 + reserved(6)=111111 + pts_time(33)
+	if !immediate {
+		pts := ptsTime90kHz & 0x1FFFFFFFF // clamp to 33 bits
+		cmd = append(cmd,
+			byte(0xFE)|(byte(pts>>32)&0x01),
+			byte(pts>>24),
+			byte(pts>>16),
+			byte(pts>>8),
+			byte(pts),
+		)
+	}
 
 	// break_duration (only when duration_flag=1): 40 bits
 	//   auto_return(1) + reserved(6) + duration_90khz(33)

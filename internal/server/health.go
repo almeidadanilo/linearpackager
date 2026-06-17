@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -19,7 +20,7 @@ type HealthInfo struct {
 	ESAMURL     string `json:"esam_url,omitempty"`
 }
 
-func (s *Server) healthHandler(startTime time.Time, version string) http.HandlerFunc {
+func (s *Server) healthHandler(startTime time.Time, version string, releaseNotes string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		base := s.cfg.Server.BaseURL
 		info := HealthInfo{
@@ -39,8 +40,11 @@ func (s *Server) healthHandler(startTime time.Time, version string) http.Handler
 		if s.cfg.ESAM.Enabled {
 			info.ESAMURL = base + s.cfg.ESAM.Path
 		}
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "text/plain")
 		w.Header().Set("Cache-Control", "no-cache")
 		json.NewEncoder(w).Encode(info)
+		if releaseNotes != "" {
+			fmt.Fprintf(w, "\n%s", releaseNotes)
+		}
 	}
 }

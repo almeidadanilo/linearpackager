@@ -53,12 +53,18 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Encode the SCTE-35 binary for this event.
+	// Always use received_at + 5s as the splice point; ignore the UTCPoint value.
+	const preRollSec = 5.0
+	ev.SpliceTime = ev.ReceivedAt.Add(preRollSec * time.Second)
+
+	// Encode the SCTE-35 binary with a timed splice 5 seconds from now.
+	ptsTime := uint64(preRollSec * 90000)
 	bin, err := scte35.EncodeSpliceInsert(
 		ev.ID,
 		ev.OutOfNetwork,
 		ev.Duration.Seconds(),
 		ev.UniqueProgramID,
+		ptsTime,
 	)
 	if err != nil {
 		slog.Error("esam: scte35 encode failed", "error", err)

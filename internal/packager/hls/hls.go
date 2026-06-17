@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/synamedia/linear-packager/internal/config"
 	"github.com/synamedia/linear-packager/internal/segment"
@@ -174,8 +175,8 @@ func (p *Packager) handleSegment(seg segment.Segment) error {
 			e.contElapsed = state.inBreak.elapsed
 			e.contTotal = state.inBreak.totalDur
 		}
-	} else if p.pendingEvt != nil && !state.applied {
-		// There's a pending splice and this rung has not yet applied it.
+	} else if p.pendingEvt != nil && !state.applied && !time.Now().Before(p.pendingEvt.SpliceTime) {
+		// There's a pending splice, this rung has not applied it, and the 5s pre-roll has elapsed.
 		e.cueOut = true
 		e.cueOutDur = p.pendingEvt.Duration.Seconds()
 		e.scte35Hex = p.pendingEvt.Hex

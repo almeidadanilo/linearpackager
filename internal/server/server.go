@@ -20,14 +20,15 @@ type ESAMRegistrar interface {
 // Server serves HLS playlists, raw TS segments, DASH segments + MPD, and
 // optionally the ESAM inbound endpoint — all on a single HTTP port.
 type Server struct {
-	cfg      *config.Config
-	esamReg  ESAMRegistrar
-	version  string
-	startAt  time.Time
+	cfg          *config.Config
+	esamReg      ESAMRegistrar
+	version      string
+	releaseNotes string
+	startAt      time.Time
 }
 
-func New(cfg *config.Config, version string) *Server {
-	return &Server{cfg: cfg, version: version, startAt: time.Now()}
+func New(cfg *config.Config, version string, releaseNotes string) *Server {
+	return &Server{cfg: cfg, version: version, releaseNotes: releaseNotes, startAt: time.Now()}
 }
 
 // RegisterESAM wires the ESAM HTTP handler into this server's mux.
@@ -58,7 +59,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.esamReg.Register(mux)
 	}
 
-	mux.HandleFunc("/health", s.healthHandler(s.startAt, s.version))
+	mux.HandleFunc("/health", s.healthHandler(s.startAt, s.version, s.releaseNotes))
 
 	addr := fmt.Sprintf(":%d", s.cfg.Server.HTTPPort)
 	srv := &http.Server{

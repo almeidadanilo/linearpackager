@@ -105,7 +105,8 @@ func main() {
 	}
 
 	// ── HTTP server (HLS + DASH + ESAM endpoint) ──────────────────────────────
-	srv := server.New(cfg, Version)
+	rnBytes, _ := os.ReadFile("rn.txt")
+	srv := server.New(cfg, Version2, string(rnBytes))
 	if cfg.ESAM.Enabled {
 		esamSrv := esam.New(&cfg.ESAM, spliceQ)
 		srv.RegisterESAM(esamSrv)
