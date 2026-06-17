@@ -1,0 +1,12 @@
+Release Notes
+
+v1.0.0 - 2026-06-05
+-   Base Version
+
+v1.1.0 - 2026-06-16
+- Several fixes on DASH output
+- Several fixes on HLS output
+- Several fixes on ffmpeg handling
+
+v1.2.0 - 2026-06-17
+- Packager fix: force delete old segments (max active: 5) avoiding disk crash

@@ -205,10 +205,20 @@ func (p *Packager) handleSegment(ctx context.Context, seg segment.Segment) {
 		duration: seg.Duration,
 		index:    seg.Index,
 	})
+	var toDelete []string
 	if len(state.entries) > state.window {
+		for _, old := range state.entries[:len(state.entries)-state.window] {
+			toDelete = append(toDelete, filepath.Join(p.outDir, seg.Rung, old.filename))
+		}
 		state.entries = state.entries[len(state.entries)-state.window:]
 	}
 	p.mu.Unlock()
+
+	for _, path := range toDelete {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			slog.Warn("dash: failed to remove old segment", "path", path, "error", err)
+		}
+	}
 
 	if err := p.writeMPD(); err != nil {
 		slog.Error("dash: MPD write failed", "error", err)

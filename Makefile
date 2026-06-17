@@ -1,7 +1,7 @@
 BINARY    := linear-packager
 CONFIG    ?= config.json
 VERSION   := $(shell git describe --tags --always 2>/dev/null || echo "1.0.0")
-LDFLAGS   := -ldflags "-X main.Version=$(VERSION)"
+LDFLAGS   := -ldflags "-X main.Version=$(VERSION2)"
 INSTALL_BIN  := /usr/local/bin
 INSTALL_SVC  := /etc/systemd/system
 CHANNELS_DIR := /opt/linear-packager/channels
