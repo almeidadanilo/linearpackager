@@ -374,14 +374,14 @@ func (p *Packager) writeMPD() error {
 				period.id, period.startSec)
 		}
 
-		// EventStream: emitted in the content period that precedes each ad break.
-		// presentationTime is relative to the Period start (timescale=1 → seconds).
-		if !period.isAd && period.spliceEvt != nil {
+		// EventStream: emitted inside the ad period itself (presentationTime=0).
+		// Iris SSAI detects the signal inside the period and replaces that period
+		// with actual ad content at the correct timeline position.
+		if period.isAd && period.spliceEvt != nil {
 			sr := period.spliceEvt
-			pt := int64(sr.presentSec - period.startSec)
 			dur := int64(sr.event.Duration.Seconds())
 			b.WriteString(`    <EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin" timescale="1">` + "\n")
-			fmt.Fprintf(&b, `      <Event presentationTime="%d" duration="%d" id="%d">`+"\n", pt, dur, sr.event.ID)
+			fmt.Fprintf(&b, `      <Event presentationTime="0" duration="%d" id="%d">`+"\n", dur, sr.event.ID)
 			b.WriteString(`        <scte35:Signal>` + "\n")
 			fmt.Fprintf(&b, `          <scte35:Binary>%s</scte35:Binary>`+"\n", sr.event.B64)
 			b.WriteString(`        </scte35:Signal>` + "\n")
