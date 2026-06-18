@@ -14,3 +14,6 @@ v1.2.0 - 2026-06-17
 v1.2.1 - 2026-06-17
 - Fixes on /health
 - Fixes on /esam/notify ... the scte35 pre-roll is fixed in 5 seconds regardless of the value informed on the ESAM XML
+
+v1.2.2 - 2026-06-17
+- Fixes on scte35 DASH manifest decoration

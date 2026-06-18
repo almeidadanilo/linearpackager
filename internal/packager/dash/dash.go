@@ -302,6 +302,7 @@ func (p *Packager) writeMPD() error {
 
 	p.mu.Lock()
 	startTime := p.startTime
+	segDurSec := float64(p.cfg.Packaging.SegmentDuration)
 	codecSnap := make(map[string]string, len(p.codecStrings))
 	for k, v := range p.codecStrings {
 		codecSnap[k] = v
@@ -324,63 +325,93 @@ func (p *Packager) writeMPD() error {
 	minUpdate := p.cfg.Packaging.SegmentDuration
 	tsDepth := p.cfg.Packaging.DASH.WindowSize * minUpdate
 	segDurMs := p.cfg.Packaging.SegmentDuration * 1000
-	// Start 3 segments behind the live edge so segments are always on disk when
-	// the player requests them.
 	presentDelay := minUpdate * 3
 
+	// ── Build period list ─────────────────────────────────────────────────────
+	// Period 0 is always a content period starting at 0. Each splice event
+	// closes the current content period, opens an ad period, then opens a new
+	// content period. EventStream goes inside the content period that precedes
+	// each break so players/SSAI know when the break is coming.
+	type mpdPeriod struct {
+		id        int
+		startSec  float64
+		endSec    float64       // 0 = open (last period)
+		isAd      bool
+		spliceEvt *spliceRecord // non-nil: content period has an upcoming break
+	}
+	var periods []mpdPeriod
+	pid := 0
+	contentStart := 0.0
+	for i := range spliceSnap {
+		sr := &spliceSnap[i]
+		breakEnd := sr.presentSec + sr.event.Duration.Seconds()
+		periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, endSec: sr.presentSec, spliceEvt: sr})
+		pid++
+		periods = append(periods, mpdPeriod{id: pid, startSec: sr.presentSec, endSec: breakEnd, isAd: true, spliceEvt: sr})
+		pid++
+		contentStart = breakEnd
+	}
+	periods = append(periods, mpdPeriod{id: pid, startSec: contentStart}) // final open period
+
+	// ── Write MPD ─────────────────────────────────────────────────────────────
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"` + "\n")
+	b.WriteString(`     xmlns:scte35="urn:scte:scte35:2014:xml+bin"` + "\n")
 	b.WriteString(`     type="dynamic"` + "\n")
 	fmt.Fprintf(&b, `     minimumUpdatePeriod="PT%dS"`+"\n", minUpdate)
 	fmt.Fprintf(&b, `     minBufferTime="PT%dS"`+"\n", minUpdate*2)
 	fmt.Fprintf(&b, `     suggestedPresentationDelay="PT%dS"`+"\n", presentDelay)
 	fmt.Fprintf(&b, `     availabilityStartTime="%s"`+"\n", startTime.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&b, `     timeShiftBufferDepth="PT%dS">`+"\n", tsDepth)
-	b.WriteString(`  <Period start="PT0S" id="1">` + "\n")
 
-	// ── SCTE-35 EventStream ───────────────────────────────────────────────────
-	if len(spliceSnap) > 0 {
-		b.WriteString(`    <EventStream schemeIdUri="urn:scte:scte35:2013:bin" timescale="1">` + "\n")
-		for _, sr := range spliceSnap {
+	for _, period := range periods {
+		if period.endSec > 0 {
+			fmt.Fprintf(&b, `  <Period id="p%d" start="PT%.3fS" duration="PT%.3fS">`+"\n",
+				period.id, period.startSec, period.endSec-period.startSec)
+		} else {
+			fmt.Fprintf(&b, `  <Period id="p%d" start="PT%.3fS">`+"\n",
+				period.id, period.startSec)
+		}
+
+		// EventStream: emitted in the content period that precedes each ad break.
+		// presentationTime is relative to the Period start (timescale=1 → seconds).
+		if !period.isAd && period.spliceEvt != nil {
+			sr := period.spliceEvt
+			pt := int64(sr.presentSec - period.startSec)
 			dur := int64(sr.event.Duration.Seconds())
-			pt := int64(sr.presentSec)
-			fmt.Fprintf(&b,
-				`      <Event presentationTime="%d" duration="%d" id="%d">%s</Event>`+"\n",
-				pt, dur, sr.event.ID, sr.event.B64,
-			)
-		}
-		b.WriteString(`    </EventStream>` + "\n")
-	}
-
-	// ── AdaptationSet + Representations (SegmentTemplate for live) ───────────
-	// SegmentTemplate lets the player compute segment N's URL as
-	// "{rung}/seg{N:05d}.mp4" using wall-clock time alone, without needing a
-	// full segment listing in every MPD update.  startNumber="0" matches our
-	// 0-based file names (seg00000.mp4, seg00001.mp4, …).
-	b.WriteString(`    <AdaptationSet id="1" mimeType="video/mp4"` + "\n")
-	b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
-
-	for _, r := range p.cfg.Transcoder.Ladder {
-		bw := (util.ParseBitrateKbps(r.VideoBitrate) + util.ParseBitrateKbps(r.AudioBitrate)) * 1000
-		codecs := codecSnap[r.Name]
-		if codecs == "" {
-			codecs = util.AVC1Codec(r.Width, r.Height, r.Framerate)
+			b.WriteString(`    <EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin" timescale="1">` + "\n")
+			fmt.Fprintf(&b, `      <Event presentationTime="%d" duration="%d" id="%d">`+"\n", pt, dur, sr.event.ID)
+			b.WriteString(`        <scte35:Signal>` + "\n")
+			fmt.Fprintf(&b, `          <scte35:Binary>%s</scte35:Binary>`+"\n", sr.event.B64)
+			b.WriteString(`        </scte35:Signal>` + "\n")
+			b.WriteString(`      </Event>` + "\n")
+			b.WriteString(`    </EventStream>` + "\n")
 		}
 
-		fmt.Fprintf(&b, `      <Representation id="%s" bandwidth="%d" width="%d" height="%d" codecs="%s">`+"\n",
-			r.Name, bw, r.Width, r.Height, codecs)
-		// %% in the format string produces a literal % in the output, giving
-		// the DASH template identifier $Number%05d$ (5-digit zero-padded).
-		fmt.Fprintf(&b, `        <SegmentTemplate media="%s/seg$Number%%05d$.mp4"`+"\n", r.Name)
-		fmt.Fprintf(&b, `                         initialization="%s/init.mp4"`+"\n", r.Name)
-		fmt.Fprintf(&b, `                         startNumber="0"`+"\n")
-		fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
-		b.WriteString(`      </Representation>` + "\n")
+		// AdaptationSet — startNumber computed from period start so the player
+		// requests the correct segment files for this period's time range.
+		startSegNo := int(period.startSec / segDurSec)
+		b.WriteString(`    <AdaptationSet id="1" mimeType="video/mp4"` + "\n")
+		b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
+		for _, r := range p.cfg.Transcoder.Ladder {
+			bw := (util.ParseBitrateKbps(r.VideoBitrate) + util.ParseBitrateKbps(r.AudioBitrate)) * 1000
+			codecs := codecSnap[r.Name]
+			if codecs == "" {
+				codecs = util.AVC1Codec(r.Width, r.Height, r.Framerate)
+			}
+			fmt.Fprintf(&b, `      <Representation id="%s" bandwidth="%d" width="%d" height="%d" codecs="%s">`+"\n",
+				r.Name, bw, r.Width, r.Height, codecs)
+			fmt.Fprintf(&b, `        <SegmentTemplate media="%s/seg$Number%%05d$.mp4"`+"\n", r.Name)
+			fmt.Fprintf(&b, `                         initialization="%s/init.mp4"`+"\n", r.Name)
+			fmt.Fprintf(&b, `                         startNumber="%d"`+"\n", startSegNo)
+			fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
+			b.WriteString(`      </Representation>` + "\n")
+		}
+		b.WriteString(`    </AdaptationSet>` + "\n")
+		b.WriteString(`  </Period>` + "\n")
 	}
 
-	b.WriteString(`    </AdaptationSet>` + "\n")
-	b.WriteString(`  </Period>` + "\n")
 	b.WriteString(`</MPD>` + "\n")
 
 	return util.WriteFileAtomic(filepath.Join(p.outDir, "manifest.mpd"), []byte(b.String()))
