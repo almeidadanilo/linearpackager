@@ -339,15 +339,24 @@ func (p *Packager) writeMPD() error {
 		isAd      bool
 		spliceEvt *spliceRecord // non-nil: content period has an upcoming break
 	}
+	// Snap a presentation time to the nearest segment boundary so that period
+	// boundaries always coincide with a segment edge.  Without this, a
+	// non-integer presentSec (e.g. 690.884 s for 6 s segments) produces a
+	// period start that is 0.884 s ahead of the actual segment boundary,
+	// causing players to request a segment that overlaps two periods.
+	snapToSeg := func(sec float64) float64 {
+		return math.Round(sec/segDurSec) * segDurSec
+	}
 	var periods []mpdPeriod
 	pid := 0
 	contentStart := 0.0
 	for i := range spliceSnap {
 		sr := &spliceSnap[i]
-		breakEnd := sr.presentSec + sr.event.Duration.Seconds()
-		periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, endSec: sr.presentSec, spliceEvt: sr})
+		snappedSplice := snapToSeg(sr.presentSec)
+		breakEnd := snapToSeg(snappedSplice + sr.event.Duration.Seconds())
+		periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, endSec: snappedSplice, spliceEvt: sr})
 		pid++
-		periods = append(periods, mpdPeriod{id: pid, startSec: sr.presentSec, endSec: breakEnd, isAd: true, spliceEvt: sr})
+		periods = append(periods, mpdPeriod{id: pid, startSec: snappedSplice, endSec: breakEnd, isAd: true, spliceEvt: sr})
 		pid++
 		contentStart = breakEnd
 	}
@@ -357,7 +366,7 @@ func (p *Packager) writeMPD() error {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"` + "\n")
-	b.WriteString(`     xmlns:scte35="urn:scte:scte35:2014:xml+bin"` + "\n")
+	b.WriteString(`     xmlns:scte35="http://www.scte.org/schemas/35/2016"` + "\n")
 	b.WriteString(`     type="dynamic"` + "\n")
 	fmt.Fprintf(&b, `     minimumUpdatePeriod="PT%dS"`+"\n", minUpdate)
 	fmt.Fprintf(&b, `     minBufferTime="PT%dS"`+"\n", minUpdate*2)
@@ -391,7 +400,8 @@ func (p *Packager) writeMPD() error {
 
 		// AdaptationSet — startNumber computed from period start so the player
 		// requests the correct segment files for this period's time range.
-		startSegNo := int(period.startSec / segDurSec)
+		// math.Round guards against floating-point drift after segment snapping.
+		startSegNo := int(math.Round(period.startSec / segDurSec))
 		b.WriteString(`    <AdaptationSet id="1" mimeType="video/mp4"` + "\n")
 		b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
 		for _, r := range p.cfg.Transcoder.Ladder {

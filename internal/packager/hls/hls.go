@@ -25,7 +25,7 @@ type entry struct {
 	// SCTE-35 markers — at most one per entry is set
 	cueOut      bool
 	cueOutDur   float64
-	scte35Hex   string // set when cueOut=true
+	scte35B64   string // base64 SCTE-35 payload; set for cueOut and cueOutCont
 	cueIn       bool
 	cueOutCont  bool
 	contElapsed float64
@@ -35,8 +35,9 @@ type entry struct {
 // ── per-rung break tracking ──────────────────────────────────────────────────
 
 type breakState struct {
-	totalDur float64 // total break duration (seconds)
-	elapsed  float64 // how much of the break has already been covered
+	totalDur  float64 // total break duration (seconds)
+	elapsed   float64 // how much of the break has already been covered
+	scte35B64 string  // base64 payload repeated on every CUE-OUT-CONT
 }
 
 type rungState struct {
@@ -174,15 +175,17 @@ func (p *Packager) handleSegment(seg segment.Segment) error {
 			e.cueOutCont = true
 			e.contElapsed = state.inBreak.elapsed
 			e.contTotal = state.inBreak.totalDur
+			e.scte35B64 = state.inBreak.scte35B64
 		}
 	} else if p.pendingEvt != nil && !state.applied && !time.Now().Before(p.pendingEvt.SpliceTime) {
 		// There's a pending splice, this rung has not applied it, and the 5s pre-roll has elapsed.
 		e.cueOut = true
 		e.cueOutDur = p.pendingEvt.Duration.Seconds()
-		e.scte35Hex = p.pendingEvt.Hex
+		e.scte35B64 = p.pendingEvt.B64
 		state.inBreak = &breakState{
-			totalDur: p.pendingEvt.Duration.Seconds(),
-			elapsed:  0,
+			totalDur:  p.pendingEvt.Duration.Seconds(),
+			elapsed:   0,
+			scte35B64: p.pendingEvt.B64,
 		}
 		state.applied = true
 		p.pendingLeft--
@@ -246,13 +249,13 @@ func (p *Packager) writeMediaPlaylist(rung string, state *rungState) error {
 	for _, e := range state.entries {
 		// SCTE-35 markers appear BEFORE the #EXTINF of their segment.
 		if e.cueOut {
-			if e.scte35Hex != "" {
-				fmt.Fprintf(&b, "#EXT-OATCLS-SCTE35:%s\n", e.scte35Hex)
+			if e.scte35B64 != "" {
+				fmt.Fprintf(&b, "#EXT-OATCLS-SCTE35:%s\n", e.scte35B64)
 			}
 			fmt.Fprintf(&b, "#EXT-X-CUE-OUT:%.3f\n", e.cueOutDur)
 		} else if e.cueOutCont {
-			fmt.Fprintf(&b, "#EXT-X-CUE-OUT-CONT:ElapsedTime=%.3f,Duration=%.3f\n",
-				e.contElapsed, e.contTotal)
+			fmt.Fprintf(&b, "#EXT-X-CUE-OUT-CONT:ElapsedTime=%.3f,Duration=%.3f,SCTE35=%s\n",
+				e.contElapsed, e.contTotal, e.scte35B64)
 		} else if e.cueIn {
 			fmt.Fprintln(&b, "#EXT-X-CUE-IN")
 		}
