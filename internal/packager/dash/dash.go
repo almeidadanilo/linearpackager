@@ -328,39 +328,50 @@ func (p *Packager) writeMPD() error {
 	presentDelay := minUpdate * 3
 
 	// ── Build period list ─────────────────────────────────────────────────────
-	// Period 0 is always a content period starting at 0. Each splice event
-	// closes the current content period, opens an ad period, then opens a new
-	// content period. EventStream goes inside the content period that precedes
-	// each break so players/SSAI know when the break is coming.
+	// We produce at most 2 periods at any time:
+	//
+	//   p0  Content  [0, splicePoint)   — closed when a break is active
+	//   p1  Splice   [splicePoint, ∞)   — open; carries EventStream while
+	//                                     the break is active, becomes plain
+	//                                     content once the event elapses.
+	//
+	// A separate closed "return-to-content" period is intentionally avoided:
+	// it would cause a second init-segment fetch and a second period transition
+	// that drains the player buffer to zero.
 	type mpdPeriod struct {
 		id        int
 		startSec  float64
 		endSec    float64       // 0 = open (last period)
 		isAd      bool
-		spliceEvt *spliceRecord // non-nil: content period has an upcoming break
+		spliceEvt *spliceRecord // non-nil: period carries an EventStream
 	}
 	// Snap a presentation time to the nearest segment boundary so that period
-	// boundaries always coincide with a segment edge.  Without this, a
-	// non-integer presentSec (e.g. 690.884 s for 6 s segments) produces a
-	// period start that is 0.884 s ahead of the actual segment boundary,
-	// causing players to request a segment that overlaps two periods.
+	// boundaries always coincide with a segment edge.
 	snapToSeg := func(sec float64) float64 {
 		return math.Round(sec/segDurSec) * segDurSec
 	}
 	var periods []mpdPeriod
 	pid := 0
 	contentStart := 0.0
+	var latestSplice *spliceRecord
 	for i := range spliceSnap {
 		sr := &spliceSnap[i]
 		snappedSplice := snapToSeg(sr.presentSec)
-		breakEnd := snapToSeg(snappedSplice + sr.event.Duration.Seconds())
-		periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, endSec: snappedSplice, spliceEvt: sr})
+		// Close the preceding content period at the segment-aligned splice point.
+		periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, endSec: snappedSplice})
 		pid++
-		periods = append(periods, mpdPeriod{id: pid, startSec: snappedSplice, endSec: breakEnd, isAd: true, spliceEvt: sr})
-		pid++
-		contentStart = breakEnd
+		contentStart = snappedSplice
+		latestSplice = sr
 	}
-	periods = append(periods, mpdPeriod{id: pid, startSec: contentStart}) // final open period
+	// The final period is always open.  It carries an EventStream while the
+	// break is active (latestSplice != nil) and is a plain content period once
+	// the break has elapsed and the event has been evicted from spliceSnap.
+	periods = append(periods, mpdPeriod{
+		id:        pid,
+		startSec:  contentStart,
+		isAd:      latestSplice != nil,
+		spliceEvt: latestSplice,
+	})
 
 	// ── Write MPD ─────────────────────────────────────────────────────────────
 	var b strings.Builder
