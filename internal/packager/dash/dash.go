@@ -415,6 +415,7 @@ func (p *Packager) writeMPD() error {
 			fmt.Fprintf(&b, `        <SegmentTemplate media="%s/seg$Number%%05d$.mp4"`+"\n", r.Name)
 			fmt.Fprintf(&b, `                         initialization="%s/init.mp4"`+"\n", r.Name)
 			fmt.Fprintf(&b, `                         startNumber="%d"`+"\n", startSegNo)
+			fmt.Fprintf(&b, `                         presentationTimeOffset="%d"`+"\n", int64(math.Round(period.startSec*1000)))
 			fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
 			b.WriteString(`      </Representation>` + "\n")
 		}
