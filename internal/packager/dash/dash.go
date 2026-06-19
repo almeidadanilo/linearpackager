@@ -328,16 +328,20 @@ func (p *Packager) writeMPD() error {
 	presentDelay := minUpdate * 3
 
 	// ── Build period list ─────────────────────────────────────────────────────
-	// We produce at most 2 periods at any time:
+	// Three-period structure per break:
 	//
-	//   p0  Content  [0, splicePoint)   — closed when a break is active
-	//   p1  Splice   [splicePoint, ∞)   — open; carries EventStream while
-	//                                     the break is active, becomes plain
-	//                                     content once the event elapses.
+	//   p(n)   Content  [prevEnd, splicePoint)          — closed
+	//   p(n+1) Ad/Splice [splicePoint, splicePoint+dur) — closed; SSAI replaces
+	//                                                     this with actual ad
+	//                                                     content, preserving the
+	//                                                     bounded duration so the
+	//                                                     player can transition
+	//                                                     back to content.
+	//   p(n+2) Content  [splicePoint+dur, ∞)            — open return-to-content
 	//
-	// A separate closed "return-to-content" period is intentionally avoided:
-	// it would cause a second init-segment fetch and a second period transition
-	// that drains the player buffer to zero.
+	// The closed ad period is essential for SSAI: an open-ended ad period causes
+	// the player to stall once the VOD ad segments are exhausted, downloading
+	// manifests forever with no more media to play.
 	type mpdPeriod struct {
 		id        int
 		startSec  float64
@@ -353,25 +357,20 @@ func (p *Packager) writeMPD() error {
 	var periods []mpdPeriod
 	pid := 0
 	contentStart := 0.0
-	var latestSplice *spliceRecord
 	for i := range spliceSnap {
 		sr := &spliceSnap[i]
 		snappedSplice := snapToSeg(sr.presentSec)
-		// Close the preceding content period at the segment-aligned splice point.
+		breakEnd := snapToSeg(snappedSplice + sr.event.Duration.Seconds())
+		// Closed content period up to the splice point.
 		periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, endSec: snappedSplice})
 		pid++
-		contentStart = snappedSplice
-		latestSplice = sr
+		// Closed ad period — bounded so SSAI knows when to return to content.
+		periods = append(periods, mpdPeriod{id: pid, startSec: snappedSplice, endSec: breakEnd, isAd: true, spliceEvt: sr})
+		pid++
+		contentStart = breakEnd
 	}
-	// The final period is always open.  It carries an EventStream while the
-	// break is active (latestSplice != nil) and is a plain content period once
-	// the break has elapsed and the event has been evicted from spliceSnap.
-	periods = append(periods, mpdPeriod{
-		id:        pid,
-		startSec:  contentStart,
-		isAd:      latestSplice != nil,
-		spliceEvt: latestSplice,
-	})
+	// Final open period: return-to-content (or pure content if no break is active).
+	periods = append(periods, mpdPeriod{id: pid, startSec: contentStart})
 
 	// ── Write MPD ─────────────────────────────────────────────────────────────
 	var b strings.Builder
@@ -384,6 +383,8 @@ func (p *Packager) writeMPD() error {
 	fmt.Fprintf(&b, `     suggestedPresentationDelay="PT%dS"`+"\n", presentDelay)
 	fmt.Fprintf(&b, `     availabilityStartTime="%s"`+"\n", startTime.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&b, `     timeShiftBufferDepth="PT%dS">`+"\n", tsDepth)
+	fmt.Fprintf(&b, `  <UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014" value="%s"/>`+"\n",
+		time.Now().UTC().Format(time.RFC3339))
 
 	for _, period := range periods {
 		if period.endSec > 0 {
