@@ -328,20 +328,12 @@ func (p *Packager) writeMPD() error {
 	presentDelay := minUpdate * 3
 
 	// ── Build period list ─────────────────────────────────────────────────────
-	// Three-period structure per break:
+	// Two-period structure per break:
 	//
-	//   p(n)   Content  [prevEnd, splicePoint)          — closed
-	//   p(n+1) Ad/Splice [splicePoint, splicePoint+dur) — closed; SSAI replaces
-	//                                                     this with actual ad
-	//                                                     content, preserving the
-	//                                                     bounded duration so the
-	//                                                     player can transition
-	//                                                     back to content.
-	//   p(n+2) Content  [splicePoint+dur, ∞)            — open return-to-content
-	//
-	// The closed ad period is essential for SSAI: an open-ended ad period causes
-	// the player to stall once the VOD ad segments are exhausted, downloading
-	// manifests forever with no more media to play.
+	//   p(n)   Content  [prevEnd, splicePoint) — closed
+	//   p(n+1) Ad/Splice [splicePoint, ∞)      — open; SSAI replaces this with
+	//                                             actual ad content and manages
+	//                                             the return-to-content itself.
 	type mpdPeriod struct {
 		id        int
 		startSec  float64
@@ -360,17 +352,17 @@ func (p *Packager) writeMPD() error {
 	for i := range spliceSnap {
 		sr := &spliceSnap[i]
 		snappedSplice := snapToSeg(sr.presentSec)
-		breakEnd := snapToSeg(snappedSplice + sr.event.Duration.Seconds())
 		// Closed content period up to the splice point.
 		periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, endSec: snappedSplice})
 		pid++
-		// Closed ad period — bounded so SSAI knows when to return to content.
-		periods = append(periods, mpdPeriod{id: pid, startSec: snappedSplice, endSec: breakEnd, isAd: true, spliceEvt: sr})
-		pid++
-		contentStart = breakEnd
+		contentStart = snappedSplice
 	}
-	// Final open period: return-to-content (or pure content if no break is active).
-	periods = append(periods, mpdPeriod{id: pid, startSec: contentStart})
+	// Final open period: ad/splice (or pure content if no break is active).
+	lastSplice := (*spliceRecord)(nil)
+	if len(spliceSnap) > 0 {
+		lastSplice = &spliceSnap[len(spliceSnap)-1]
+	}
+	periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, isAd: lastSplice != nil, spliceEvt: lastSplice})
 
 	// ── Write MPD ─────────────────────────────────────────────────────────────
 	var b strings.Builder
