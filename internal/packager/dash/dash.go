@@ -307,12 +307,18 @@ func (p *Packager) writeMPD() error {
 	for k, v := range p.codecStrings {
 		codecSnap[k] = v
 	}
-	// Evict splice events whose break has fully elapsed so they disappear from the MPD.
+	// Evict splice events only after the break has left the timeshift window.
+	// Dropping an event the instant the break ends collapses the manifest from
+	// 2 periods back to 1 while the player is still inside p1, causing it to
+	// lose its current period and stall downloading only manifests.
+	minUpdate := p.cfg.Packaging.SegmentDuration
+	tsDepth := p.cfg.Packaging.DASH.WindowSize * minUpdate
 	if !startTime.IsZero() {
 		elapsed := time.Since(startTime).Seconds()
+		tsDepthSec := float64(tsDepth)
 		var active []spliceRecord
 		for _, sr := range p.spliceEvents {
-			if elapsed < sr.presentSec+sr.event.Duration.Seconds() {
+			if elapsed < sr.presentSec+sr.event.Duration.Seconds()+tsDepthSec {
 				active = append(active, sr)
 			}
 		}
@@ -321,9 +327,6 @@ func (p *Packager) writeMPD() error {
 	spliceSnap := make([]spliceRecord, len(p.spliceEvents))
 	copy(spliceSnap, p.spliceEvents)
 	p.mu.Unlock()
-
-	minUpdate := p.cfg.Packaging.SegmentDuration
-	tsDepth := p.cfg.Packaging.DASH.WindowSize * minUpdate
 	segDurMs := p.cfg.Packaging.SegmentDuration * 1000
 	presentDelay := minUpdate * 3
 
