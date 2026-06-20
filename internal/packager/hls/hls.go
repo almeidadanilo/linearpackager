@@ -245,7 +245,6 @@ func (p *Packager) writeMediaPlaylist(rung string, state *rungState) error {
 	fmt.Fprintln(&b, "#EXT-X-VERSION:3")
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", targetDur)
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", seq)
-	fmt.Fprintln(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:0")
 
 	for _, e := range state.entries {
 		// SCTE-35 markers appear BEFORE the #EXTINF of their segment.
