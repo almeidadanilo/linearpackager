@@ -133,7 +133,11 @@ func (c *Config) applyDefaults() {
 		c.Packaging.HLS.PlaylistWindow = 5
 	}
 	if c.Packaging.DASH.WindowSize == 0 {
-		c.Packaging.DASH.WindowSize = 5
+		// 55 segments × 6 s = 330 s timeShiftBufferDepth.
+		// Must cover the maximum ad-break duration so the first post-splice
+		// content segment is still on disk when the player returns from the ad.
+		// Formula: ceil(max_ad_break_sec / segment_dur_sec) + margin = ceil(300/6) + 5 = 55.
+		c.Packaging.DASH.WindowSize = 55
 	}
 }
 

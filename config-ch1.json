@@ -45,7 +45,7 @@
   "packaging": {
     "segment_duration": 6,
     "work_dir": "./output/ch1/segments",
-    "segment_retention": 7,
+    "segment_retention": 57,
     "hls": {
       "enabled": true,
       "playlist_window": 5,
@@ -53,7 +53,7 @@
     },
     "dash": {
       "enabled": true,
-      "window_size": 5,
+      "window_size": 55,
       "output_dir": "./output/ch1/dash"
     }
   },
