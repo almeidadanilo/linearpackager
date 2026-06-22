@@ -389,14 +389,16 @@ func (p *Packager) writeMPD() error {
 	minUpdate := p.cfg.Packaging.SegmentDuration
 	tsDepth := p.cfg.Packaging.DASH.WindowSize * minUpdate
 	presentDelay := minUpdate * 3
+	var elapsed float64
 	if !startTime.IsZero() {
-		elapsed := time.Since(startTime).Seconds()
-		// Keep each splice event (and its p1 period) until tsDepth seconds
-		// after the break ends.  The tail must be > (ad_duration + SPD) so the
-		// player has time to exit the ad, enter p1, and buffer content before
-		// p1 collapses back to a single p0.  Minimum safe tail = SPD = 18 s;
-		// tsDepth (60 s) gives ~42 s of stable p1 content after the player
-		// exits the ad, which covers any reasonable player buffering delay.
+		elapsed = time.Since(startTime).Seconds()
+	}
+	if !startTime.IsZero() {
+		// Keep the p1 period alive for tsDepth seconds after the break ends so
+		// the player has time to exit the ad and buffer content.  The EventStream
+		// inside p1 is removed separately (see below) as soon as the declared
+		// ad duration elapses, preventing SSAI from treating the lingering signal
+		// as a new ad opportunity and looping manifest-only fetches after the ad.
 		tail := float64(tsDepth)
 		var active []spliceRecord
 		for _, sr := range p.spliceEvents {
@@ -479,7 +481,13 @@ func (p *Packager) writeMPD() error {
 		}
 
 		// EventStream: signals an ad opportunity to Iris SSAI.
-		if period.isAd && period.spliceEvt != nil {
+		// Only emitted while the declared break window is still open.  Once the
+		// break duration has elapsed the EventStream is dropped so SSAI does not
+		// treat the lingering p1 period as a new ad opportunity.  p1 itself
+		// remains for tsDepth more seconds (eviction block above) so the player
+		// can smoothly return to content after the ad ends.
+		if period.isAd && period.spliceEvt != nil &&
+			elapsed < period.spliceEvt.presentSec+period.spliceEvt.event.Duration.Seconds() {
 			sr := period.spliceEvt
 			pto := int64(math.Round(period.startSec * 1000))
 			durMs := int64(sr.event.Duration.Seconds() * 1000)
