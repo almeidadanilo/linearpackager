@@ -544,10 +544,15 @@ func (p *Packager) prepareOutputDirs() error {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", dir, err)
 		}
+		// Remove any stale init.mp4 from a previous run so it is always
+		// regenerated with the current demux configuration (video-only).
+		// Stale muxed inits cause MSE codec-mismatch errors in the player.
+		_ = os.Remove(filepath.Join(dir, "init.mp4"))
 	}
 	if err := os.MkdirAll(p.audioDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", p.audioDir, err)
 	}
+	_ = os.Remove(filepath.Join(p.audioDir, "init.mp4"))
 	return nil
 }
 
