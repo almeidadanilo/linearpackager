@@ -351,10 +351,14 @@ func remuxToFMP4(tsPath, videoPath, audioPath string, audioFragDurUs int) error 
 	}
 	if audioPath != "" {
 		// Audio: strip video, convert ADTS→raw AAC, fragment at segment boundary.
+		// frag_keyframe enables fragmentation; -frag_duration (an AVFormatContext
+		// option, not a movflag) sets the minimum fragment size so the whole
+		// ~6s segment collapses into one moof+mdat.  This avoids the movflag
+		// "frag_duration" constant which was only added in newer FFmpeg builds.
 		args = append(args,
 			"-map", "0:a", "-c:a", "copy", "-bsf:a", "aac_adtstoasc",
 			"-f", "mp4",
-			"-movflags", "frag_duration+delay_moov+default_base_moof",
+			"-movflags", "frag_keyframe+delay_moov+default_base_moof",
 			"-frag_duration", fmt.Sprintf("%d", audioFragDurUs),
 			audioPath,
 		)
