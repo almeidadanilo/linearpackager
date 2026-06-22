@@ -376,7 +376,7 @@ func (p *Packager) writeMPD() error {
 
 	p.mu.Lock()
 	startTime := p.startTime
-	segDurSec := float64(p.cfg.Packaging.SegmentDuration)
+
 	codecSnap := make(map[string]string, len(p.codecStrings))
 	for k, v := range p.codecStrings {
 		codecSnap[k] = v
@@ -405,43 +405,6 @@ func (p *Packager) writeMPD() error {
 	segDurMs := p.cfg.Packaging.SegmentDuration * 1000
 	presentDelay := minUpdate * 3
 
-	// ── Build period list ─────────────────────────────────────────────────────
-	// Two-period structure per break:
-	//
-	//   p(n)   Content  [prevEnd, splicePoint) — closed
-	//   p(n+1) Ad/Splice [splicePoint, ∞)      — open; SSAI replaces this with
-	//                                             actual ad content and manages
-	//                                             the return-to-content itself.
-	type mpdPeriod struct {
-		id        int
-		startSec  float64
-		endSec    float64       // 0 = open (last period)
-		isAd      bool
-		spliceEvt *spliceRecord // non-nil: period carries an EventStream
-	}
-	// Snap a presentation time to the nearest segment boundary so that period
-	// boundaries always coincide with a segment edge.
-	snapToSeg := func(sec float64) float64 {
-		return math.Round(sec/segDurSec) * segDurSec
-	}
-	var periods []mpdPeriod
-	pid := 0
-	contentStart := 0.0
-	for i := range spliceSnap {
-		sr := &spliceSnap[i]
-		snappedSplice := snapToSeg(sr.presentSec)
-		// Closed content period up to the splice point.
-		periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, endSec: snappedSplice})
-		pid++
-		contentStart = snappedSplice
-	}
-	// Final open period: ad/splice (or pure content if no break is active).
-	lastSplice := (*spliceRecord)(nil)
-	if len(spliceSnap) > 0 {
-		lastSplice = &spliceSnap[len(spliceSnap)-1]
-	}
-	periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, isAd: lastSplice != nil, spliceEvt: lastSplice})
-
 	// Audio bandwidth from the first rung configuration.
 	audioBwBps := util.ParseBitrateKbps(p.cfg.Transcoder.Ladder[0].AudioBitrate) * 1000
 
@@ -460,79 +423,72 @@ func (p *Packager) writeMPD() error {
 	fmt.Fprintf(&b, `  <UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014" value="%s"/>`+"\n",
 		time.Now().UTC().Format(time.RFC3339))
 
-	for _, period := range periods {
-		if period.endSec > 0 {
-			fmt.Fprintf(&b, `  <Period id="p%d" start="PT%.3fS" duration="PT%.3fS">`+"\n",
-				period.id, period.startSec, period.endSec-period.startSec)
-		} else {
-			fmt.Fprintf(&b, `  <Period id="p%d" start="PT%.3fS">`+"\n",
-				period.id, period.startSec)
-		}
+	// ── Single always-open p0 period ─────────────────────────────────────────
+	// Never pre-split into p0+p1 at the splice point: that creates a period
+	// boundary right at the live edge the instant the SCTE-35 fires, causing
+	// dash.js to do a full stream reset exactly where the player is, which
+	// stalls segment downloads.
+	//
+	// Instead we keep one open p0 and embed any SCTE-35 signal as an
+	// EventStream inside it — the vDCM reference pattern.  SSAI reads the
+	// EventStream, inserts its own ad period, and manages the return-to-content
+	// period without us ever closing p0.
+	b.WriteString(`  <Period id="p0" start="PT0.000S">` + "\n")
 
-		// EventStream: signals an ad opportunity to Iris SSAI.
-		// timescale=1000 matches the SegmentTemplate timescale so presentationTime
-		// and presentationTimeOffset can be expressed directly in milliseconds,
-		// aligning them with the SegmentTemplate presentationTimeOffset.
-		// This mirrors the vDCM reference format that SSAI is designed to consume.
-		if period.isAd && period.spliceEvt != nil {
-			sr := period.spliceEvt
-			pto := int64(math.Round(period.startSec * 1000))
-			durMs := int64(sr.event.Duration.Seconds() * 1000)
-			fmt.Fprintf(&b, `    <EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin" timescale="1000" presentationTimeOffset="%d">`+"\n", pto)
-			fmt.Fprintf(&b, `      <Event presentationTime="%d" duration="%d" id="%d">`+"\n", pto, durMs, sr.event.ID)
-			b.WriteString(`        <scte35:Signal>` + "\n")
-			fmt.Fprintf(&b, `          <scte35:Binary>%s</scte35:Binary>`+"\n", sr.event.B64)
-			b.WriteString(`        </scte35:Signal>` + "\n")
-			b.WriteString(`      </Event>` + "\n")
-			b.WriteString(`    </EventStream>` + "\n")
-		}
-
-		// AdaptationSet — startNumber computed from period start so the player
-		// requests the correct segment files for this period's time range.
-		// math.Round guards against floating-point drift after segment snapping.
-		startSegNo := int(math.Round(period.startSec / segDurSec))
-		pto := int64(math.Round(period.startSec * 1000))
-
-		// Video AdaptationSet.
-		b.WriteString(`    <AdaptationSet id="1" mimeType="video/mp4" contentType="video"` + "\n")
-		b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
-		b.WriteString(`      <Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>` + "\n")
-		for _, r := range p.cfg.Transcoder.Ladder {
-			bw := util.ParseBitrateKbps(r.VideoBitrate) * 1000
-			codecs := codecSnap[r.Name]
-			if codecs == "" {
-				codecs = util.AVC1Codec(r.Width, r.Height, r.Framerate)
-			}
-			fmt.Fprintf(&b, `      <Representation id="%s" bandwidth="%d" width="%d" height="%d" codecs="%s">`+"\n",
-				r.Name, bw, r.Width, r.Height, codecs)
-			fmt.Fprintf(&b, `        <SegmentTemplate media="%s/seg$Number%%05d$.mp4"`+"\n", r.Name)
-			fmt.Fprintf(&b, `                         initialization="%s/init.mp4"`+"\n", r.Name)
-			fmt.Fprintf(&b, `                         startNumber="%d"`+"\n", startSegNo)
-			fmt.Fprintf(&b, `                         presentationTimeOffset="%d"`+"\n", pto)
-			fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
-			b.WriteString(`      </Representation>` + "\n")
-		}
-		b.WriteString(`    </AdaptationSet>` + "\n")
-
-		// Audio AdaptationSet — included once the first audio init segment is ready.
-		if audioReady {
-			b.WriteString(`    <AdaptationSet id="2" mimeType="audio/mp4" contentType="audio" lang="und"` + "\n")
-			b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
-			b.WriteString(`      <Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>` + "\n")
-			fmt.Fprintf(&b, `      <Representation id="audio" bandwidth="%d" codecs="mp4a.40.2" audioSamplingRate="48000">`+"\n", audioBwBps)
-			b.WriteString(`        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>` + "\n")
-			b.WriteString(`        <SegmentTemplate media="audio/seg$Number%05d$.mp4"` + "\n")
-			b.WriteString(`                         initialization="audio/init.mp4"` + "\n")
-			fmt.Fprintf(&b, `                         startNumber="%d"`+"\n", startSegNo)
-			fmt.Fprintf(&b, `                         presentationTimeOffset="%d"`+"\n", pto)
-			fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
-			b.WriteString(`      </Representation>` + "\n")
-			b.WriteString(`    </AdaptationSet>` + "\n")
-		}
-
-		b.WriteString(`  </Period>` + "\n")
+	// EventStream — present whenever a splice event is active.
+	// presentationTime is the absolute splice point in ms (timescale=1000).
+	// presentationTimeOffset=0 because p0 starts at time 0.
+	for i := range spliceSnap {
+		sr := &spliceSnap[i]
+		spliceMs := int64(math.Round(sr.presentSec * 1000))
+		durMs := int64(sr.event.Duration.Seconds() * 1000)
+		b.WriteString(`    <EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin" timescale="1000" presentationTimeOffset="0">` + "\n")
+		fmt.Fprintf(&b, `      <Event presentationTime="%d" duration="%d" id="%d">`+"\n", spliceMs, durMs, sr.event.ID)
+		b.WriteString(`        <scte35:Signal>` + "\n")
+		fmt.Fprintf(&b, `          <scte35:Binary>%s</scte35:Binary>`+"\n", sr.event.B64)
+		b.WriteString(`        </scte35:Signal>` + "\n")
+		b.WriteString(`      </Event>` + "\n")
+		b.WriteString(`    </EventStream>` + "\n")
 	}
 
+	// Video AdaptationSet — p0 always starts at 0, so startNumber=0 and PTO=0.
+	b.WriteString(`    <AdaptationSet id="1" mimeType="video/mp4" contentType="video"` + "\n")
+	b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
+	b.WriteString(`      <Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>` + "\n")
+	for _, r := range p.cfg.Transcoder.Ladder {
+		bw := util.ParseBitrateKbps(r.VideoBitrate) * 1000
+		codecs := codecSnap[r.Name]
+		if codecs == "" {
+			codecs = util.AVC1Codec(r.Width, r.Height, r.Framerate)
+		}
+		fmt.Fprintf(&b, `      <Representation id="%s" bandwidth="%d" width="%d" height="%d" codecs="%s">`+"\n",
+			r.Name, bw, r.Width, r.Height, codecs)
+		fmt.Fprintf(&b, `        <SegmentTemplate media="%s/seg$Number%%05d$.mp4"`+"\n", r.Name)
+		fmt.Fprintf(&b, `                         initialization="%s/init.mp4"`+"\n", r.Name)
+		b.WriteString(`                         startNumber="0"` + "\n")
+		b.WriteString(`                         presentationTimeOffset="0"` + "\n")
+		fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
+		b.WriteString(`      </Representation>` + "\n")
+	}
+	b.WriteString(`    </AdaptationSet>` + "\n")
+
+	// Audio AdaptationSet — included once the first audio init segment is ready.
+	if audioReady {
+		b.WriteString(`    <AdaptationSet id="2" mimeType="audio/mp4" contentType="audio" lang="und"` + "\n")
+		b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
+		b.WriteString(`      <Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>` + "\n")
+		fmt.Fprintf(&b, `      <Representation id="audio" bandwidth="%d" codecs="mp4a.40.2" audioSamplingRate="48000">`+"\n", audioBwBps)
+		b.WriteString(`        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>` + "\n")
+		b.WriteString(`        <SegmentTemplate media="audio/seg$Number%05d$.mp4"` + "\n")
+		b.WriteString(`                         initialization="audio/init.mp4"` + "\n")
+		b.WriteString(`                         startNumber="0"` + "\n")
+		b.WriteString(`                         presentationTimeOffset="0"` + "\n")
+		fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
+		b.WriteString(`      </Representation>` + "\n")
+		b.WriteString(`    </AdaptationSet>` + "\n")
+	}
+
+	b.WriteString(`  </Period>` + "\n")
 	b.WriteString(`</MPD>` + "\n")
 
 	return util.WriteFileAtomic(filepath.Join(p.outDir, "manifest.mpd"), []byte(b.String()))
