@@ -40,7 +40,7 @@ func AVC1Codec(width, height, fps int) string {
 	default:
 		level = 0x1e // 3.0
 	}
-	return fmt.Sprintf("avc1.6400%02x,mp4a.40.2", level)
+	return fmt.Sprintf("avc1.6400%02x", level)
 }
 
 // WriteFileAtomic writes data to path, creating the parent directory if

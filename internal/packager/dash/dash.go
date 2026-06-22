@@ -46,15 +46,20 @@ type rungState struct {
 type Packager struct {
 	cfg          *config.Config
 	outDir       string
+	audioDir     string            // outDir/audio — shared audio track across all rungs
 	rungs        map[string]*rungState
 	codecStrings map[string]string // rung → actual RFC 6381 codec string from avcC box
-	mu           sync.Mutex        // protects rungs + startTime + spliceEvents + codecStrings
+	mu           sync.Mutex        // protects all mutable fields below
 	mpdMu        sync.Mutex        // serialises manifest.mpd writes (Windows rename contention)
 	startTime    time.Time
 	sem          chan struct{}
 
 	spliceIn     <-chan splice.Event
 	spliceEvents []spliceRecord // retained splice events to include in MPD
+
+	// Audio track — populated only from the first ladder rung.
+	audioEntries []segEntry
+	audioReady   bool // true once audio/init.mp4 has been written
 }
 
 func New(cfg *config.Config) *Packager {
@@ -65,6 +70,7 @@ func New(cfg *config.Config) *Packager {
 	return &Packager{
 		cfg:          cfg,
 		outDir:       cfg.Packaging.DASH.OutputDir,
+		audioDir:     filepath.Join(cfg.Packaging.DASH.OutputDir, "audio"),
 		rungs:        rungs,
 		codecStrings: make(map[string]string),
 		sem:          make(chan struct{}, maxConcurrentRemux),
@@ -150,11 +156,22 @@ func (p *Packager) handleSegment(ctx context.Context, seg segment.Segment) {
 	mp4Name := strings.TrimSuffix(filepath.Base(seg.Path), ".ts") + ".mp4"
 	mp4Path := filepath.Join(p.outDir, seg.Rung, mp4Name)
 
-	if err := remuxToFMP4(seg.Path, mp4Path); err != nil {
+	// Only extract audio from the first rung — all rungs carry identical audio.
+	isAudioRung := seg.Rung == p.cfg.Transcoder.Ladder[0].Name
+	audioPath := ""
+	if isAudioRung {
+		audioPath = filepath.Join(p.audioDir, mp4Name)
+	}
+
+	// audioFragDurUs: use 1.5× segment duration so the entire audio segment
+	// always lands in a single moof/mdat fragment.
+	audioFragDurUs := p.cfg.Packaging.SegmentDuration * 1_500_000
+	if err := remuxToFMP4(seg.Path, mp4Path, audioPath, audioFragDurUs); err != nil {
 		slog.Error("dash: remux failed", "segment", filepath.Base(seg.Path), "error", err)
 		return
 	}
 
+	// ── Process video track ───────────────────────────────────────────────────
 	fmp4Data, err := os.ReadFile(mp4Path)
 	if err != nil {
 		slog.Error("dash: read fmp4 failed", "rung", seg.Rung, "error", err)
@@ -169,19 +186,15 @@ func (p *Packager) handleSegment(ctx context.Context, seg segment.Segment) {
 	// FFmpeg normalises remuxed timestamps to start at 0 for every segment.
 	// DASH players use the MPD timeline to seek, so each fragment's
 	// baseMediaDecodeTime must reflect its absolute position in the stream.
-	// Use the actual PTS start time from the segment CSV (seg.StartTime) rather
-	// than segIdx×segDur so the offset is exact even when segment durations
-	// are not perfectly uniform or the packager attached mid-stream.
 	if ts := parseTrackTimescales(initBytes); len(ts) > 0 {
 		patchTFDT(mediaBytes, seg.StartTime, ts)
 	}
-
 	if err := os.WriteFile(mp4Path, mediaBytes, 0o644); err != nil {
 		slog.Error("dash: write media segment failed", "rung", seg.Rung, "error", err)
 		return
 	}
 
-	// Write init.mp4 once per rung and extract the actual codec string from avcC.
+	// Write video init.mp4 once per rung and extract codec string from avcC.
 	var detectedCodec string
 	initPath := filepath.Join(p.outDir, seg.Rung, "init.mp4")
 	if _, statErr := os.Stat(initPath); os.IsNotExist(statErr) && len(initBytes) > 0 {
@@ -193,6 +206,40 @@ func (p *Packager) handleSegment(ctx context.Context, seg segment.Segment) {
 		slog.Info("dash: init segment written", "rung", seg.Rung, "codec", detectedCodec)
 	}
 
+	// ── Process audio track (first rung only) ─────────────────────────────────
+	var audioToDelete []string
+	var audioEntry *segEntry
+	if isAudioRung {
+		aData, aErr := os.ReadFile(audioPath)
+		if aErr != nil {
+			slog.Error("dash: read audio fmp4 failed", "error", aErr)
+		} else {
+			aInit, aMedia, aErr := splitFMP4(aData)
+			if aErr != nil {
+				slog.Error("dash: audio fMP4 split failed", "error", aErr)
+			} else {
+				if ats := parseTrackTimescales(aInit); len(ats) > 0 {
+					patchTFDT(aMedia, seg.StartTime, ats)
+				}
+				if aErr = os.WriteFile(audioPath, aMedia, 0o644); aErr != nil {
+					slog.Error("dash: write audio segment failed", "error", aErr)
+				} else {
+					audioEntry = &segEntry{filename: mp4Name, duration: seg.Duration, index: seg.Index}
+				}
+				// Write audio init.mp4 once.
+				audioInitPath := filepath.Join(p.audioDir, "init.mp4")
+				if _, statErr := os.Stat(audioInitPath); os.IsNotExist(statErr) && len(aInit) > 0 {
+					if aErr = util.WriteFileAtomic(audioInitPath, aInit); aErr != nil {
+						slog.Error("dash: write audio init failed", "error", aErr)
+					} else {
+						slog.Info("dash: audio init segment written")
+					}
+				}
+			}
+		}
+	}
+
+	// ── Update shared state ───────────────────────────────────────────────────
 	p.mu.Lock()
 	if detectedCodec != "" {
 		p.codecStrings[seg.Rung] = detectedCodec
@@ -213,9 +260,19 @@ func (p *Packager) handleSegment(ctx context.Context, seg segment.Segment) {
 		}
 		state.entries = state.entries[len(state.entries)-state.window:]
 	}
+	if audioEntry != nil {
+		p.audioEntries = append(p.audioEntries, *audioEntry)
+		p.audioReady = true
+		if len(p.audioEntries) > p.cfg.Packaging.DASH.WindowSize {
+			for _, old := range p.audioEntries[:len(p.audioEntries)-p.cfg.Packaging.DASH.WindowSize] {
+				audioToDelete = append(audioToDelete, filepath.Join(p.audioDir, old.filename))
+			}
+			p.audioEntries = p.audioEntries[len(p.audioEntries)-p.cfg.Packaging.DASH.WindowSize:]
+		}
+	}
 	p.mu.Unlock()
 
-	for _, path := range toDelete {
+	for _, path := range append(toDelete, audioToDelete...) {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			slog.Warn("dash: failed to remove old segment", "path", path, "error", err)
 		}
@@ -271,25 +328,38 @@ func parseAVC1Codec(data []byte) string {
 	if data[idx+4] != 1 { // configurationVersion must be 1
 		return ""
 	}
-	return fmt.Sprintf("avc1.%02x%02x%02x,mp4a.40.2", data[idx+5], data[idx+6], data[idx+7])
+	return fmt.Sprintf("avc1.%02x%02x%02x", data[idx+5], data[idx+6], data[idx+7])
 }
 
-// remuxToFMP4 converts an MPEG-TS segment to a self-contained fragmented MP4.
-func remuxToFMP4(tsPath, mp4Path string) error {
-	// AAC in MPEG-TS uses ADTS framing; MP4 requires ADIF (raw) framing.
-	// The aac_adtstoasc BSF strips the ADTS headers during remux.
-	// delay_moov defers the moov box until after the first fragment has been
-	// processed.  This ensures aac_adtstoasc has seen an audio packet and can
-	// write a complete AudioSpecificConfig into the esds box, and it produces
-	// proper moof+mdat ordering (no standalone mdat before the first moof).
-	cmd := exec.Command("ffmpeg", "-y", "-loglevel", "error",
+// remuxToFMP4 converts an MPEG-TS segment to fragmented MP4.
+// videoPath receives a video-only fMP4 (frag_keyframe).
+// If audioPath is non-empty, an audio-only fMP4 is also written in the same
+// FFmpeg invocation using frag_duration so the whole segment lands in one
+// fragment regardless of AAC frame boundaries.
+// audioFragDurUs is the minimum fragment duration for audio in microseconds;
+// set it to at least the segment duration to guarantee a single fragment.
+func remuxToFMP4(tsPath, videoPath, audioPath string, audioFragDurUs int) error {
+	// Video: strip audio, fragment on keyframes (every segment starts with one).
+	// delay_moov defers moov until after the first fragment so avcC/esds boxes
+	// are fully populated before they are written.
+	args := []string{
+		"-y", "-loglevel", "error",
 		"-i", tsPath,
-		"-c", "copy",
-		"-bsf:a", "aac_adtstoasc",
-		"-f", "mp4",
-		"-movflags", "frag_keyframe+delay_moov+default_base_moof",
-		mp4Path,
-	)
+		"-map", "0:v", "-c:v", "copy",
+		"-f", "mp4", "-movflags", "frag_keyframe+delay_moov+default_base_moof",
+		videoPath,
+	}
+	if audioPath != "" {
+		// Audio: strip video, convert ADTS→raw AAC, fragment at segment boundary.
+		args = append(args,
+			"-map", "0:a", "-c:a", "copy", "-bsf:a", "aac_adtstoasc",
+			"-f", "mp4",
+			"-movflags", "frag_duration+delay_moov+default_base_moof",
+			"-frag_duration", fmt.Sprintf("%d", audioFragDurUs),
+			audioPath,
+		)
+	}
+	cmd := exec.Command("ffmpeg", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -307,6 +377,7 @@ func (p *Packager) writeMPD() error {
 	for k, v := range p.codecStrings {
 		codecSnap[k] = v
 	}
+	audioReady := p.audioReady
 	// Evict splice events only after the break has left the timeshift window.
 	// Dropping an event the instant the break ends collapses the manifest from
 	// 2 periods back to 1 while the player is still inside p1, causing it to
@@ -367,11 +438,15 @@ func (p *Packager) writeMPD() error {
 	}
 	periods = append(periods, mpdPeriod{id: pid, startSec: contentStart, isAd: lastSplice != nil, spliceEvt: lastSplice})
 
+	// Audio bandwidth from the first rung configuration.
+	audioBwBps := util.ParseBitrateKbps(p.cfg.Transcoder.Ladder[0].AudioBitrate) * 1000
+
 	// ── Write MPD ─────────────────────────────────────────────────────────────
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"` + "\n")
 	b.WriteString(`     xmlns:scte35="http://www.scte.org/schemas/35/2016"` + "\n")
+	b.WriteString(`     profiles="urn:mpeg:dash:profile:isoff-live:2011"` + "\n")
 	b.WriteString(`     type="dynamic"` + "\n")
 	fmt.Fprintf(&b, `     minimumUpdatePeriod="PT%dS"`+"\n", minUpdate)
 	fmt.Fprintf(&b, `     minBufferTime="PT%dS"`+"\n", minUpdate*2)
@@ -390,14 +465,17 @@ func (p *Packager) writeMPD() error {
 				period.id, period.startSec)
 		}
 
-		// EventStream: emitted inside the ad period itself (presentationTime=0).
-		// Iris SSAI detects the signal inside the period and replaces that period
-		// with actual ad content at the correct timeline position.
+		// EventStream: signals an ad opportunity to Iris SSAI.
+		// timescale=1000 matches the SegmentTemplate timescale so presentationTime
+		// and presentationTimeOffset can be expressed directly in milliseconds,
+		// aligning them with the SegmentTemplate presentationTimeOffset.
+		// This mirrors the vDCM reference format that SSAI is designed to consume.
 		if period.isAd && period.spliceEvt != nil {
 			sr := period.spliceEvt
-			dur := int64(sr.event.Duration.Seconds())
-			b.WriteString(`    <EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin" timescale="1">` + "\n")
-			fmt.Fprintf(&b, `      <Event presentationTime="0" duration="%d" id="%d">`+"\n", dur, sr.event.ID)
+			pto := int64(math.Round(period.startSec * 1000))
+			durMs := int64(sr.event.Duration.Seconds() * 1000)
+			fmt.Fprintf(&b, `    <EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin" timescale="1000" presentationTimeOffset="%d">`+"\n", pto)
+			fmt.Fprintf(&b, `      <Event presentationTime="%d" duration="%d" id="%d">`+"\n", pto, durMs, sr.event.ID)
 			b.WriteString(`        <scte35:Signal>` + "\n")
 			fmt.Fprintf(&b, `          <scte35:Binary>%s</scte35:Binary>`+"\n", sr.event.B64)
 			b.WriteString(`        </scte35:Signal>` + "\n")
@@ -409,10 +487,14 @@ func (p *Packager) writeMPD() error {
 		// requests the correct segment files for this period's time range.
 		// math.Round guards against floating-point drift after segment snapping.
 		startSegNo := int(math.Round(period.startSec / segDurSec))
-		b.WriteString(`    <AdaptationSet id="1" mimeType="video/mp4"` + "\n")
+		pto := int64(math.Round(period.startSec * 1000))
+
+		// Video AdaptationSet.
+		b.WriteString(`    <AdaptationSet id="1" mimeType="video/mp4" contentType="video"` + "\n")
 		b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
+		b.WriteString(`      <Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>` + "\n")
 		for _, r := range p.cfg.Transcoder.Ladder {
-			bw := (util.ParseBitrateKbps(r.VideoBitrate) + util.ParseBitrateKbps(r.AudioBitrate)) * 1000
+			bw := util.ParseBitrateKbps(r.VideoBitrate) * 1000
 			codecs := codecSnap[r.Name]
 			if codecs == "" {
 				codecs = util.AVC1Codec(r.Width, r.Height, r.Framerate)
@@ -422,11 +504,28 @@ func (p *Packager) writeMPD() error {
 			fmt.Fprintf(&b, `        <SegmentTemplate media="%s/seg$Number%%05d$.mp4"`+"\n", r.Name)
 			fmt.Fprintf(&b, `                         initialization="%s/init.mp4"`+"\n", r.Name)
 			fmt.Fprintf(&b, `                         startNumber="%d"`+"\n", startSegNo)
-			fmt.Fprintf(&b, `                         presentationTimeOffset="%d"`+"\n", int64(math.Round(period.startSec*1000)))
+			fmt.Fprintf(&b, `                         presentationTimeOffset="%d"`+"\n", pto)
 			fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
 			b.WriteString(`      </Representation>` + "\n")
 		}
 		b.WriteString(`    </AdaptationSet>` + "\n")
+
+		// Audio AdaptationSet — included once the first audio init segment is ready.
+		if audioReady {
+			b.WriteString(`    <AdaptationSet id="2" mimeType="audio/mp4" contentType="audio" lang="und"` + "\n")
+			b.WriteString(`                   segmentAlignment="true" startWithSAP="1">` + "\n")
+			b.WriteString(`      <Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>` + "\n")
+			fmt.Fprintf(&b, `      <Representation id="audio" bandwidth="%d" codecs="mp4a.40.2" audioSamplingRate="48000">`+"\n", audioBwBps)
+			b.WriteString(`        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>` + "\n")
+			b.WriteString(`        <SegmentTemplate media="audio/seg$Number%05d$.mp4"` + "\n")
+			b.WriteString(`                         initialization="audio/init.mp4"` + "\n")
+			fmt.Fprintf(&b, `                         startNumber="%d"`+"\n", startSegNo)
+			fmt.Fprintf(&b, `                         presentationTimeOffset="%d"`+"\n", pto)
+			fmt.Fprintf(&b, `                         duration="%d" timescale="1000"/>`+"\n", segDurMs)
+			b.WriteString(`      </Representation>` + "\n")
+			b.WriteString(`    </AdaptationSet>` + "\n")
+		}
+
 		b.WriteString(`  </Period>` + "\n")
 	}
 
@@ -441,6 +540,9 @@ func (p *Packager) prepareOutputDirs() error {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", dir, err)
 		}
+	}
+	if err := os.MkdirAll(p.audioDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", p.audioDir, err)
 	}
 	return nil
 }
