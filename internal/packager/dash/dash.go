@@ -391,12 +391,13 @@ func (p *Packager) writeMPD() error {
 	presentDelay := minUpdate * 3
 	if !startTime.IsZero() {
 		elapsed := time.Since(startTime).Seconds()
-		// Keep each splice event (and its p1 period) until SPD + one manifest
-		// refresh cycle after the break ends.  This gives the player enough
-		// time to exit the ad and find p1 before we collapse back to single-
-		// period.  Using tsDepthSec here was too conservative (60 s), making
-		// the SCTE-35 signal linger in the manifest well after the break.
-		tail := float64(presentDelay + minUpdate)
+		// Keep each splice event (and its p1 period) until tsDepth seconds
+		// after the break ends.  The tail must be > (ad_duration + SPD) so the
+		// player has time to exit the ad, enter p1, and buffer content before
+		// p1 collapses back to a single p0.  Minimum safe tail = SPD = 18 s;
+		// tsDepth (60 s) gives ~42 s of stable p1 content after the player
+		// exits the ad, which covers any reasonable player buffering delay.
+		tail := float64(tsDepth)
 		var active []spliceRecord
 		for _, sr := range p.spliceEvents {
 			if elapsed < sr.presentSec+sr.event.Duration.Seconds()+tail {
