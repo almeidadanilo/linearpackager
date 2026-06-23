@@ -78,10 +78,11 @@ type DASHConfig struct {
 }
 
 type ESAMConfig struct {
-	Enabled                  bool   `json:"enabled"`
-	ListenPort               int    `json:"listen_port"`
-	Path                     string `json:"path"`                      // HTTP path, e.g. "/esam/notify"
-	AcquisitionPointIdentity string `json:"acquisition_point_identity"` // matches esamid in SOAP payload
+	Enabled                  bool    `json:"enabled"`
+	ListenPort               int     `json:"listen_port"`
+	Path                     string  `json:"path"`                      // HTTP path, e.g. "/esam/notify"
+	AcquisitionPointIdentity string  `json:"acquisition_point_identity"` // matches esamid in SOAP payload
+	SplicePreRollSec         float64 `json:"splice_pre_roll_sec"`        // seconds to advance the splice point; 0 = immediate
 }
 
 type ServerConfig struct {

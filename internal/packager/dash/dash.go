@@ -106,10 +106,9 @@ func (p *Packager) drainSplices(ctx context.Context) {
 			if !p.startTime.IsZero() {
 				elapsed = time.Since(p.startTime).Seconds()
 			}
-			// Place the splice point 5 seconds ahead (pre-roll) in the presentation timeline.
 			p.spliceEvents = append(p.spliceEvents, spliceRecord{
 				event:      e,
-				presentSec: elapsed + 5.0,
+				presentSec: elapsed + p.cfg.ESAM.SplicePreRollSec,
 			})
 			// Trim events whose break has fully elapsed from the presentation.
 			var keep []spliceRecord

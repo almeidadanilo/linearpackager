@@ -53,11 +53,11 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Always use received_at + 5s as the splice point; ignore the UTCPoint value.
-	const preRollSec = 0.0
-	ev.SpliceTime = ev.ReceivedAt.Add(preRollSec * time.Second)
+	// Always use received_at + pre_roll as the splice point; ignore the UTCPoint value.
+	preRollSec := s.cfg.SplicePreRollSec
+	ev.SpliceTime = ev.ReceivedAt.Add(time.Duration(preRollSec * float64(time.Second)))
 
-	// Encode the SCTE-35 binary with a timed splice 5 seconds from now.
+	// Encode the SCTE-35 binary with the configured pre-roll PTS offset (90 kHz clock).
 	ptsTime := uint64(preRollSec * 90000)
 	bin, err := scte35.EncodeSpliceInsert(
 		ev.ID,

@@ -178,7 +178,7 @@ func (p *Packager) handleSegment(seg segment.Segment) error {
 			e.scte35B64 = state.inBreak.scte35B64
 		}
 	} else if p.pendingEvt != nil && !state.applied && !time.Now().Before(p.pendingEvt.SpliceTime) {
-		// There's a pending splice, this rung has not applied it, and the 5s pre-roll has elapsed.
+		// There's a pending splice, this rung has not applied it, and the pre-roll delay has elapsed.
 		e.cueOut = true
 		e.cueOutDur = p.pendingEvt.Duration.Seconds()
 		e.scte35B64 = p.pendingEvt.B64
