@@ -487,7 +487,7 @@ func (p *Packager) writeMPD() error {
 		// remains for tsDepth more seconds (eviction block above) so the player
 		// can smoothly return to content after the ad ends.
 		if period.isAd && period.spliceEvt != nil &&
-			elapsed < period.spliceEvt.presentSec+period.spliceEvt.event.Duration.Seconds() {
+			elapsed < snapToSeg(period.spliceEvt.presentSec)+period.spliceEvt.event.Duration.Seconds() {
 			sr := period.spliceEvt
 			pto := int64(math.Round(period.startSec * 1000))
 			durMs := int64(sr.event.Duration.Seconds() * 1000)
