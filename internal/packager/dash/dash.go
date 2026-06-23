@@ -549,21 +549,28 @@ func (p *Packager) writeMPD() error {
 }
 
 func (p *Packager) prepareOutputDirs() error {
-	for _, r := range p.cfg.Transcoder.Ladder {
-		dir := filepath.Join(p.outDir, r.Name)
+	cleanDir := func(dir string) error {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", dir, err)
 		}
-		// Remove any stale init.mp4 from a previous run so it is always
-		// regenerated with the current demux configuration (video-only).
-		// Stale muxed inits cause MSE codec-mismatch errors in the player.
-		_ = os.Remove(filepath.Join(dir, "init.mp4"))
+		// Wipe all .mp4 files so orphan segments from previous runs do not
+		// accumulate.  Orphans from long-lived runs have very high sequence
+		// numbers that the new run's retention logic never reaches, so they
+		// would persist forever and corrupt the retention window ordering.
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".mp4") {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+			}
+		}
+		return nil
 	}
-	if err := os.MkdirAll(p.audioDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", p.audioDir, err)
+	for _, r := range p.cfg.Transcoder.Ladder {
+		if err := cleanDir(filepath.Join(p.outDir, r.Name)); err != nil {
+			return err
+		}
 	}
-	_ = os.Remove(filepath.Join(p.audioDir, "init.mp4"))
-	return nil
+	return cleanDir(p.audioDir)
 }
 
 // scanBoxes calls fn(boxType, payload) for every top-level ISO BMFF box in

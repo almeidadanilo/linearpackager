@@ -122,12 +122,15 @@ func (c *Config) applyDefaults() {
 		c.Packaging.WorkDir = "./output/segments"
 	}
 	if c.Packaging.SegmentRetention == 0 {
-		// Minimum for linear (no startover): cover the largest window + 2 safety margin.
+		// segment_retention must be >= DASH window_size so that the splice-
+		// point segment is still on disk when the SSAI player returns from the
+		// ad (which can be up to window_size segments after the splice).
+		// Add 5 as a processing-delay buffer.
 		maxWindow := c.Packaging.HLS.PlaylistWindow
 		if c.Packaging.DASH.WindowSize > maxWindow {
 			maxWindow = c.Packaging.DASH.WindowSize
 		}
-		c.Packaging.SegmentRetention = maxWindow + 2
+		c.Packaging.SegmentRetention = maxWindow + 5
 	}
 	if c.Packaging.HLS.PlaylistWindow == 0 {
 		c.Packaging.HLS.PlaylistWindow = 5

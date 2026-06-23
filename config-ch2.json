@@ -45,7 +45,7 @@
   "packaging": {
     "segment_duration": 6,
     "work_dir": "./output/ch2/segments",
-    "segment_retention": 12,
+    "segment_retention": 65,
     "hls": {
       "enabled": true,
       "playlist_window": 5,
