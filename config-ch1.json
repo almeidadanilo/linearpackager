@@ -48,12 +48,12 @@
     "segment_retention": 65,
     "hls": {
       "enabled": true,
-      "playlist_window": 5,
+      "playlist_window": 20,
       "output_dir": "./output/ch1/hls"
     },
     "dash": {
       "enabled": true,
-      "window_size": 10,
+      "window_size": 20,
       "output_dir": "./output/ch1/dash"
     }
   },

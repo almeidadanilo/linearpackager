@@ -253,21 +253,26 @@ func (p *Packager) handleSegment(ctx context.Context, seg segment.Segment) {
 		duration: seg.Duration,
 		index:    seg.Index,
 	})
+	// segment_retention controls how many fMP4 files stay on disk.
+	// This is intentionally larger than window_size (the manifest window)
+	// so that the splice-point segment remains available on disk until the
+	// SSAI player returns from the ad and requests it.
+	diskRetention := p.cfg.Packaging.SegmentRetention
 	var toDelete []string
-	if len(state.entries) > state.window {
-		for _, old := range state.entries[:len(state.entries)-state.window] {
+	if len(state.entries) > diskRetention {
+		for _, old := range state.entries[:len(state.entries)-diskRetention] {
 			toDelete = append(toDelete, filepath.Join(p.outDir, seg.Rung, old.filename))
 		}
-		state.entries = state.entries[len(state.entries)-state.window:]
+		state.entries = state.entries[len(state.entries)-diskRetention:]
 	}
 	if audioEntry != nil {
 		p.audioEntries = append(p.audioEntries, *audioEntry)
 		p.audioReady = true
-		if len(p.audioEntries) > p.cfg.Packaging.DASH.WindowSize {
-			for _, old := range p.audioEntries[:len(p.audioEntries)-p.cfg.Packaging.DASH.WindowSize] {
+		if len(p.audioEntries) > diskRetention {
+			for _, old := range p.audioEntries[:len(p.audioEntries)-diskRetention] {
 				audioToDelete = append(audioToDelete, filepath.Join(p.audioDir, old.filename))
 			}
-			p.audioEntries = p.audioEntries[len(p.audioEntries)-p.cfg.Packaging.DASH.WindowSize:]
+			p.audioEntries = p.audioEntries[len(p.audioEntries)-diskRetention:]
 		}
 	}
 	p.mu.Unlock()
