@@ -486,13 +486,13 @@ func (p *Packager) writeMPD() error {
 		}
 
 		// EventStream: signals an ad opportunity to Iris SSAI.
-		// Only emitted while the declared break window is still open.  Once the
-		// break duration has elapsed the EventStream is dropped so SSAI does not
-		// treat the lingering p1 period as a new ad opportunity.  p1 itself
-		// remains for tsDepth more seconds (eviction block above) so the player
-		// can smoothly return to content after the ad ends.
-		if period.isAd && period.spliceEvt != nil &&
-			elapsed < snapToSeg(period.spliceEvt.presentSec)+period.spliceEvt.event.Duration.Seconds() {
+		// Kept for the full p1 lifetime (tsDepth seconds after break end).
+		// Removing it early caused SSAI to interpret the disappearance as
+		// "break ended" and transition back to linear while the ad was still
+		// in the player's buffer — resulting in the ad being downloaded but
+		// never played.  SSAI deduplicates by Event id, so re-triggering is
+		// not a concern.
+		if period.isAd && period.spliceEvt != nil {
 			sr := period.spliceEvt
 			pto := int64(math.Round(period.startSec * 1000))
 			durMs := int64(sr.event.Duration.Seconds() * 1000)
